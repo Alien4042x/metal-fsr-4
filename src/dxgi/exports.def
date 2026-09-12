@@ -1,0 +1,9 @@
+LIBRARY dxgi
+EXPORTS
+CreateDXGIFactory=wfCreateDXGIFactory @1
+CreateDXGIFactory1=wfCreateDXGIFactory1 @2
+CreateDXGIFactory2=wfCreateDXGIFactory2 @3
+DXGID3D10CreateDevice=wfDXGID3D10CreateDevice @4
+DXGID3D10RegisterLayers=wfDXGID3D10RegisterLayers @5
+DXGIGetDebugInterface1=wfDXGIGetDebugInterface1 @6
+DXGIDeclareAdapterRemovalSupport=wfDXGIDeclareAdapterRemovalSupport @7

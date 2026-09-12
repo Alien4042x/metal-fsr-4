@@ -1,0 +1,39 @@
+{
+  "url": "https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/releases/download/v2.0.0/FidelityFX-SDK-v2.0.0.zip",
+  "zip_size": 130172282,
+  "transferred": 123650,
+  "files": {
+    "Kits/FidelityFX/api/include/ffx_api.h": {
+      "size": 7821,
+      "sha256": "00ff81f5829e6db4ed2fe0de47d67b55dbe20f8991186cb13b825c2549ffeab5"
+    },
+    "Kits/FidelityFX/api/include/dx12/ffx_api_dx12.h": {
+      "size": 8888,
+      "sha256": "9725f0f7e2f2d040037a1815ee2f08e73b5c3322bf89b4c5353d0ebeb4f1e347"
+    },
+    "Kits/FidelityFX/api/include/ffx_api_types.h": {
+      "size": 11521,
+      "sha256": "1e1f23e21c6b63bf243cf4844f0a7ef22a546fe03f1cd34282b97c8d961bce2a"
+    },
+    "Kits/FidelityFX/api/include/ffx_api-helper.h": {
+      "size": 9214,
+      "sha256": "b0e6f00c4bf84996049b4fe0da1039ef28314f8c015315529e2f338cd923cefe"
+    },
+    "Kits/FidelityFX/api/include/ffx_api_loader.h": {
+      "size": 2763,
+      "sha256": "d5bf5f6dfa5aa6a8354672c22ef18bd8d6c77686b1e598f33348ae3a9d7c45c1"
+    },
+    "Kits/FidelityFX/framegeneration/include/ffx_framegeneration_api_types.h": {
+      "size": 4767,
+      "sha256": "274a1b5bac2e9d0b5074cf7e63bb2fbf17ec2721d45e0315ea5f2c4c1c681562"
+    },
+    "Kits/FidelityFX/framegeneration/include/dx12/ffx_api_framegeneration_dx12.h": {
+      "size": 6978,
+      "sha256": "89237d8b1c31d63ebf0434bc2b4ba14bdf85dabb6cb7fd361d31c0b773ea1430"
+    },
+    "Kits/FidelityFX/framegeneration/include/ffx_framegeneration.h": {
+      "size": 15152,
+      "sha256": "fb9255fbe6c8739685a5ecdfab4bed5ff2a44139e55bd8656bf7abc3f25235f6"
+    }
+  }
+}

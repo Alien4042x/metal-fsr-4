@@ -1,0 +1,22 @@
+/.local/
+# Generated binaries, model data and editor files
+*.dll
+*.dylib
+*.exe
+*.so
+*.bin
+*.metallib
+*.air
+*.lib
+*.a
+*.log
+__pycache__/
+*.pyc
+.DS_Store
+/src/bridge/build-command.json
+
+# Local release packages and launch settings
+/release/
+
+# Local test provenance (machine paths and candidate identities)
+/experimental/cube/integration-provenance.json

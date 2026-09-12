@@ -1,0 +1,23 @@
+{
+  "pre.hlsl": {
+    "same_structure_excluding_weight_arrays_float_constants_whitespace": true,
+    "normalized_lengths": [
+      274,
+      274
+    ]
+  },
+  "post.hlsl": {
+    "same_structure_excluding_weight_arrays_float_constants_whitespace": true,
+    "normalized_lengths": [
+      10091,
+      10091
+    ]
+  },
+  "passes_1080.hlsl": {
+    "same_structure_excluding_weight_arrays_float_constants_whitespace": true,
+    "normalized_lengths": [
+      98825,
+      98825
+    ]
+  }
+}

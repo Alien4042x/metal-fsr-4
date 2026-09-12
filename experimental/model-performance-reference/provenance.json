@@ -1,0 +1,25 @@
+{
+  "commit": "01446e6a74888bf349652fcf2cbf5f642d30c2bf",
+  "files": {
+    "pre.hlsl": {
+      "url": "https://raw.githubusercontent.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/01446e6a74888bf349652fcf2cbf5f642d30c2bf/Kits/FidelityFX/upscalers/fsr4/internal/shaders/fsr4_model_v07_i8_performance/pre.hlsl",
+      "sha256": "115195d8d8a8a39cf0d9224ff95781c332f17d9432d41d2ff81da80cf1d70898"
+    },
+    "post.hlsl": {
+      "url": "https://raw.githubusercontent.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/01446e6a74888bf349652fcf2cbf5f642d30c2bf/Kits/FidelityFX/upscalers/fsr4/internal/shaders/fsr4_model_v07_i8_performance/post.hlsl",
+      "sha256": "a69b1a70b2a1244d40892b48069b434b761239faa221f73ea8558da65ce472c9"
+    },
+    "passes_1080.hlsl": {
+      "url": "https://raw.githubusercontent.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/01446e6a74888bf349652fcf2cbf5f642d30c2bf/Kits/FidelityFX/upscalers/fsr4/internal/shaders/fsr4_model_v07_i8_performance/passes_1080.hlsl",
+      "sha256": "58d5a7fbbd7408e28d1903095a8a9706e4c2c0dfc1dc977fe68ac9bf68b3207d"
+    },
+    "initializers.bin": {
+      "url": "https://raw.githubusercontent.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/01446e6a74888bf349652fcf2cbf5f642d30c2bf/Kits/FidelityFX/upscalers/fsr4/internal/shaders/fsr4_model_v07_i8_performance/initializers.bin",
+      "sha256": "fe2ad00e9e7fc563bd9ee01ab72c82bb557bf0d8365a085e833749547e089aab"
+    },
+    "shader_selector.cpp": {
+      "url": "https://raw.githubusercontent.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/01446e6a74888bf349652fcf2cbf5f642d30c2bf/Kits/FidelityFX/upscalers/fsr4/internal/shader_selector.cpp",
+      "sha256": "1b22f5e4de3576697c156fc2772568701ccd95c96762d9c65d5b5f666c0b3ee0"
+    }
+  }
+}

@@ -1,0 +1,11 @@
+[
+  "Kits/Cauldron2/dx12/framework/libs/acs/LICENSE.txt",
+  "Kits/Cauldron2/dx12/framework/libs/ags/LICENSE.txt",
+  "Kits/Cauldron2/dx12/framework/libs/imgui/LICENSE.txt",
+  "Kits/Cauldron2/dx12/framework/libs/vectormath/LICENSE.txt",
+  "Kits/FidelityFX/bin/amd_fidelityfx_framegeneration_dx12.dll",
+  "Kits/FidelityFX/framegeneration/include/ffx_framegeneration.h",
+  "Kits/FidelityFX/signedbin/amd_fidelityfx_framegeneration_dx12.dll",
+  "Kits/OpenSource/imgui/LICENSE.txt",
+  "Kits/OpenSource/vectormath/LICENSE.txt"
+]
