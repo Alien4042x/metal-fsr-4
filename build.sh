@@ -63,7 +63,7 @@ show_status() {
         'A separate FG PE observes and forwards calls to the original AMD provider.' \
         'An opt-in native DXGI proxy supports games without native FG calls.' \
         'Build and verify do not install into Wine or any game.' \
-        'See README.md and TESTING.md.'
+        'See README.md.'
 }
 
 run_choice() {

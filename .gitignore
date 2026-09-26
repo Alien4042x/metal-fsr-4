@@ -21,3 +21,8 @@ __pycache__/
 
 # Local test provenance (machine paths and candidate identities)
 /experimental/cube/integration-provenance.json
+
+# Keep local launchers and working notes out of the public source snapshot.
+/fsr-hook.command
+*.md
+!/README.md
