@@ -32,7 +32,8 @@ SOFTWARE.
 ========================================================================
 AMD FidelityFX SDK API headers (2026)
 Locations:
-  src/vendor/fsr-sdk-2.3.0/
+  src/vendor/FidelityFX-SDK/Kits/FidelityFX/ (pinned Git submodule)
+  src/vendor/fsr-sdk-2.3.0/ (compatibility symlink)
 
 This file is part of the FidelityFX SDK.
 

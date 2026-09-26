@@ -1,0 +1,4 @@
+[submodule "src/vendor/FidelityFX-SDK"]
+	path = src/vendor/FidelityFX-SDK
+	url = https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK.git
+	shallow = true
