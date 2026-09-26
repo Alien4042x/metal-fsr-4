@@ -39,7 +39,25 @@ bool initialize() {
         if(!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS|GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,reinterpret_cast<LPCWSTR>(&ffxCreateContext),&self))return;
         wchar_t path[32768];const DWORD n=GetModuleFileNameW(self,path,32768);if(!n||n==32768)return;
         original.directory.assign(path,n);const auto slash=original.directory.find_last_of(L"\\/");if(slash==std::wstring::npos)return;original.directory.resize(slash+1);
-        const auto name=original.directory+L"wf_original_fidelityfx_loader_dx12.dll";
+        // Native-FG trial: load its admission adapter before querying providers.
+        if(environment(L"METAL_FG401_EXECUTE")) {
+            const auto adapter=original.directory+L"amdxc64.dll";
+            if(!LoadLibraryExW(adapter.c_str(),nullptr,LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR|LOAD_LIBRARY_SEARCH_DEFAULT_DIRS)) {
+                fprintf(stderr,"AMD401_ADAPTER_LOAD_FAILED error=%lu\n",GetLastError());return;
+            }
+        }
+        // An external wrapper can delegate to the game's untouched loader.
+        // An absolute path is required because the wrapper may live in a bottle.
+        wchar_t originalPath[32768]{};
+        const DWORD originalLength=GetEnvironmentVariableW(L"METAL_FSR4_ORIGINAL_LOADER",originalPath,32768);
+        if(originalLength>=32768){fprintf(stderr,"FSR4_ORIGINAL_LOADER invalid=too_long\n");return;}
+        const bool drivePath=originalLength>=3&&
+            ((originalPath[0]>=L'A'&&originalPath[0]<=L'Z')||(originalPath[0]>=L'a'&&originalPath[0]<=L'z'))&&
+            originalPath[1]==L':'&&(originalPath[2]==L'\\'||originalPath[2]==L'/');
+        const bool uncPath=originalLength>=3&&originalPath[0]==L'\\'&&originalPath[1]==L'\\';
+        if(originalLength&&!drivePath&&!uncPath){fprintf(stderr,"FSR4_ORIGINAL_LOADER invalid=relative_path\n");return;}
+        const std::wstring name=originalLength?std::wstring(originalPath,originalLength):
+            original.directory+L"wf_original_fidelityfx_loader_dx12.dll";
         original.module=LoadLibraryExW(name.c_str(),nullptr,LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR|LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
         if(!original.module||original.module==self)return;
         original.create=reinterpret_cast<PfnFfxCreateContext>(GetProcAddress(original.module,"ffxCreateContext"));
@@ -88,7 +106,15 @@ extern "C" FFX_API_ENTRY ffxReturnCode_t ffxCreateContext(ffxContext* context,ff
     try {
         if(!initialize())return FFX_API_RETURN_NO_PROVIDER;
         if(!context||!header)return FFX_API_RETURN_ERROR_PARAMETER;
-        if(!original.enabled||callbacks||header->type!=FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE)return original.create(context,header,callbacks);
+        // Record admission independently of dispatch counters: bypassed contexts
+        // otherwise look like a loaded, but inexplicably inactive Metal path.
+        if(original.traceEnabled) {
+            fprintf(stderr,"FSR4_ADMISSION type=%llx enabled=%u callbacks=%u upgrade31=%u\n",
+                (unsigned long long)header->type,unsigned(original.enabled),unsigned(callbacks!=nullptr),unsigned(original.upgrade31));
+            unsigned n=0;for(auto p=header->pNext;p&&n<16;p=p->pNext,++n)
+                fprintf(stderr,"FSR4_ADMISSION extension[%u]=%llx\n",n,(unsigned long long)p->type);
+        }
+        if(!original.enabled||header->type!=FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE)return original.create(context,header,callbacks);
         ID3D12Device* device=nullptr;const ffxOverrideVersion* requested=nullptr;bool supportedChain=true;
         const ffxCreateContextDescUpscaleVersion* apiVersion=nullptr;
         unsigned depth=0;
@@ -97,13 +123,13 @@ extern "C" FFX_API_ENTRY ffxReturnCode_t ffxCreateContext(ffxContext* context,ff
             else if(p->type==FFX_API_DESC_TYPE_OVERRIDE_VERSION&&!requested)requested=reinterpret_cast<ffxOverrideVersion*>(p);
             else if(p->type==FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE_VERSION&&!apiVersion)apiVersion=reinterpret_cast<ffxCreateContextDescUpscaleVersion*>(p);
             else supportedChain=false;}
-        if(!supportedChain||!device)return original.create(context,header,callbacks);
+        if(!supportedChain||!device){if(original.traceEnabled)fprintf(stderr,"FSR4_ADMISSION bypass=descriptor_chain supported=%u device=%u\n",unsigned(supportedChain),unsigned(device!=nullptr));return original.create(context,header,callbacks);}
         const auto available=versions(device);uint64_t fallbackId=0;bool request31=false;
         for(const auto& v:available){if(!fallbackId||std::strncmp(v.name,"3.1.",4)==0)fallbackId=v.id;
             if(requested&&requested->versionId==v.id)request31=std::strncmp(v.name,"3.1.",4)==0;}
         const bool explicitOurs=requested&&requested->versionId==wfFsr4VersionId;
         const bool wantsOurs=explicitOurs||!requested||(original.upgrade31&&request31);
-        if(!wantsOurs)return original.create(context,header,callbacks);
+        if(!wantsOurs){if(original.traceEnabled)fprintf(stderr,"FSR4_ADMISSION bypass=requested_provider id=%llx available=%zu\n",(unsigned long long)(requested?requested->versionId:0),available.size());return original.create(context,header,callbacks);}
         if(!fallbackId)return FFX_API_RETURN_NO_PROVIDER;
         auto create=*reinterpret_cast<ffxCreateContextDescUpscale*>(header);
         ffxCreateBackendDX12Desc backend{};backend.header.type=FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_DX12;backend.device=device;
@@ -138,9 +164,18 @@ extern "C" FFX_API_ENTRY ffxReturnCode_t ffxConfigure(ffxContext* context,const 
         if(!state){const auto rc=original.configure(context,header);
             if(original.traceEnabled)traceConfigure(context,header,rc,false,false);return rc;}
         std::lock_guard<std::mutex> lock(state->mutex);const auto rc=original.configure(context,header);
-        // Unknown configuration may change original semantics. Stay on original
-        // until a new context instead of silently ignoring its effect in FSR4.
-        if(rc==FFX_API_RETURN_OK){state->disabled=true;state->status.backend=0;reason(*state,"configuration selects original provider");}
+        // Explicit SDK defaults do not change the original provider's semantics.
+        // Keep non-default/unknown configuration on the original implementation.
+        bool defaultSetting=false;
+        if(header&&header->type==FFX_API_CONFIGURE_DESC_TYPE_UPSCALE_KEYVALUE&&!header->pNext){
+            const auto& kv=*reinterpret_cast<const ffxConfigureDescUpscaleKeyValue*>(header);
+            constexpr float defaults[]={1.0f,1.0f,1.0f,1.0f/3.0f,-1.0f/3.0f};
+            if(kv.key<5&&kv.ptr&&kv.u64==0){
+                float value;std::memcpy(&value,kv.ptr,sizeof(value));
+                defaultSetting=value==defaults[kv.key];
+            }
+        }
+        if(rc==FFX_API_RETURN_OK&&!defaultSetting){state->disabled=true;state->status.backend=0;reason(*state,"non-default or unknown configuration selects original provider");}
         if(original.traceEnabled)traceConfigure(context,header,rc,true,state->disabled);
         return rc;
     }catch(...){return FFX_API_RETURN_ERROR_RUNTIME_ERROR;}

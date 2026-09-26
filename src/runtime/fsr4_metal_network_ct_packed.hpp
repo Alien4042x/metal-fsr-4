@@ -4,12 +4,16 @@
 #include <stdexcept>
 #include <cstdio>
 #include "fsr4_metal_asset_paths.hpp"
+#include "fsr4_model_presets.hpp"
 // WineForge-Internal: fsr4/caller-owned-metal-network-encoder-v1.
 // No Wine ABI, queue, submit, wait, or mapped-memory ownership in the graph.
 class Fsr4MetalNetworkCtPacked {
  id<MTLDevice> device; NSString* tileSource;NSString* tailSource;NSString* fnb32Source;NSString* fnb64Source;bool tiledFnb32;bool packedCt;
  id<MTLComputePipelineState> pipelines[16],maskPipeline;
  id<MTLBuffer> constants[17][4],tensors[15],dummy,ctPacked;
+ struct Model { id<MTLBuffer> constants[17][4], ctPacked; id<MTLComputePipelineState> first; };
+ Model models[5];
+ Fsr4ModelPreset activePreset=Fsr4ModelPreset::Unsupported;
  unsigned graphWidth=0,graphHeight=0;
  static void need(bool x,const char* why){if(!x)throw std::runtime_error(why);}
 struct Layer {unsigned pass,kind,channels,skip;};
@@ -18,8 +22,12 @@ static constexpr Layer layers[]={
  {4,3,32,0},{5,3,32,0},{6,2,32,0},{7,3,64,0},
  {8,3,64,0},{9,3,64,0},{9,4,64,6},{10,3,32,0},
  {11,3,32,0},{11,4,32,3},{12,1,16,0},{13,1,16,0},{13,4,16,0}};
-id<MTLLibrary> library(NSString* file,NSString* prefix){
+id<MTLLibrary> library(NSString* file,NSString* prefix,float pass0Scale=0.f){
  auto text=[NSString stringWithContentsOfFile:fsr4AssetPath(@"shaders",file) encoding:NSUTF8StringEncoding error:nil];need(text!=nil,"graph shader source");
+ if(pass0Scale>0.f){
+  need([text containsString:@"0.012475206516683102"],"pass0 quantization literal");
+  text=[text stringByReplacingOccurrencesOfString:@"0.012475206516683102" withString:[NSString stringWithFormat:@"%.17g",double(pass0Scale)]];
+ }
  auto options=[MTLCompileOptions new];options.languageVersion=MTLLanguageVersion2_3;options.mathMode=MTLMathModeSafe;options.mathFloatingPointFunctions=MTLMathFloatingPointFunctionsPrecise;
  NSError* e=nil;auto lib=[device newLibraryWithSource:[prefix stringByAppendingString:text] options:options error:&e];
  need(lib&&e==nil,e?e.localizedDescription.UTF8String:"graph compile");return lib;
@@ -36,13 +44,13 @@ void initialize(id<MTLDevice> supplied,unsigned width,unsigned height){
  need(!device&&width&&height&&width<=3440&&height<=1440,"bounded graph extent/context");
  graphWidth=(width+7)&~7u;graphHeight=(height+7)&~7u;device=supplied;need(device&&[device supportsFamily:MTLGPUFamilyApple7],"Apple7 matrix admission");
 
- auto p0=library(@"wine_temporal_batch_pass0.metal",@"constant bool batchTrace [[function_constant(1)]];\n");
+
  auto b16=library(tileSource,@"");
  auto b32=library(fnb32Source,@"#define FNB_RAW_TRACE 0\n");
  auto b64=library(fnb64Source,@"#define FNB64_RAW_TRACE 0\n");
  auto conv=library(@"wine_temporal_batch_convolutions.metal",@"");
  auto tail=library(tailSource,@"#define BLOCK16_RAW_TRACE 0\n");
- pipelines[0]=pipeline(p0,@"pass0402");auto plain16=pipeline(b16,@"block16_tile8x2");
+ auto plain16=pipeline(b16,@"block16_tile8x2");
  auto plain32=pipeline(b32,@"fnb32_matrix",0),fold32=pipeline(b32,@"fnb32_matrix",1);
  auto plain64=pipeline(b64,@"fnb64_matrix",0),fold64=pipeline(b64,@"fnb64_matrix",1);
  for(unsigned i=1;i<15;++i){auto l=layers[i];
@@ -57,21 +65,29 @@ void initialize(id<MTLDevice> supplied,unsigned width,unsigned height){
   {20992,896,32,41984},{20992,896,32,41984},{20992,896,32,41984},
   {8192,128,20,0},{6400,448,32,12800},{6400,448,32,12800},{2048,64,20,0},
   {3328,256,36,6656},{3328,256,36,6656},{512,16,8,0}};
- NSString* names[]={@"weights.bin",@"biases.bin",@"scales.bin",@"packed.bin"};
  size_t constantBytes=0;
+ for(unsigned modelIndex=0;modelIndex<5;++modelIndex){
+  auto& model=models[modelIndex];auto preset=Fsr4ModelPreset(modelIndex);
+  NSString* category=preset==Fsr4ModelPreset::Balanced ? @"weights" : [NSString stringWithFormat:@"presets/%s/weights",fsr4ModelName(preset)];
+  auto p0=library(@"wine_temporal_batch_pass0.metal",@"constant bool batchTrace [[function_constant(1)]];\n",fsr4Pass0Scale(preset));
+  model.first=pipeline(p0,@"pass0402");
+ NSString* names[]={@"weights.bin",@"biases.bin",@"scales.bin",@"packed.bin"};
+
  for(unsigned i=0;i<17;++i)for(unsigned j=0;j<4;++j)if(sizes[i][j]){
-  auto data=[NSData dataWithContentsOfFile:fsr4AssetPath(@"weights",[NSString stringWithFormat:@"%u/%@",i,names[j]])];
+  auto data=[NSData dataWithContentsOfFile:fsr4AssetPath(category,[NSString stringWithFormat:@"%u/%@",i,names[j]])];
   need(data&&data.length==sizes[i][j],"exact graph asset span");
-  constants[i][j]=[device newBufferWithBytes:data.bytes length:data.length options:MTLResourceStorageModeShared];
-  need(constants[i][j]!=nil,"graph weights allocation");constantBytes+=data.length;
+  model.constants[i][j]=[device newBufferWithBytes:data.bytes length:data.length options:MTLResourceStorageModeShared];
+  need(model.constants[i][j]!=nil,"graph weights allocation");constantBytes+=data.length;
  }
  // Prepare both arms identically; only candidate binds this immutable layout.
- _Float16 packed[512];auto original=static_cast<const int8_t*>(constants[16][0].contents);
+ _Float16 packed[512];auto original=static_cast<const int8_t*>(model.constants[16][0].contents);
  for(unsigned z=0;z<4;++z)for(unsigned k=0;k<16;++k)for(unsigned c=0;c<8;++c){
   packed[z*128+k*8+c]=_Float16(original[z*128+c*16+k]);
   need(float(packed[z*128+k*8+c])==float(original[z*128+c*16+k]),"exact CT weight packing");
  }
- ctPacked=[device newBufferWithBytes:packed length:sizeof(packed) options:MTLResourceStorageModeShared];need(ctPacked!=nil,"packed CT allocation");constantBytes+=sizeof(packed);
+ model.ctPacked=[device newBufferWithBytes:packed length:sizeof(packed) options:MTLResourceStorageModeShared];need(model.ctPacked!=nil,"packed CT allocation");constantBytes+=sizeof(packed);
+ }
+ selectPreset(Fsr4ModelPreset::Balanced);
  // Dense activations only; disabled per-channel traces use a 256-byte dummy.
  // 36*outputPixels bytes, max 178329600 bytes. Two external maps add
  // 32*outputPixels (158515200 bytes at 3440x1440), plus page rounding.
@@ -99,6 +115,13 @@ public:
  }
  Fsr4MetalNetworkCtPacked(const Fsr4MetalNetworkCtPacked&)=delete;
  Fsr4MetalNetworkCtPacked& operator=(const Fsr4MetalNetworkCtPacked&)=delete;
+ void selectPreset(Fsr4ModelPreset preset){
+  need(unsigned(preset)<5,"trained model unavailable");
+  if(preset==activePreset)return;
+  auto& model=models[unsigned(preset)];
+  for(unsigned i=0;i<17;++i)for(unsigned j=0;j<4;++j)constants[i][j]=model.constants[i][j];
+  ctPacked=model.ctPacked;pipelines[0]=model.first;activePreset=preset;
+ }
  void encode(id<MTLCommandBuffer> cmd,id<MTLBuffer> input,id<MTLBuffer> output,unsigned width,unsigned height,bool tailOnly=false){
   unsigned w=(width+7)&~7u,h=(height+7)&~7u,divisor=1;
   need(cmd&&width&&height&&w<=graphWidth&&h<=graphHeight&&input.length>=size_t(w)*h*16&&output.length>=size_t(w)*h*16,"native graph encode spans");
@@ -113,7 +136,7 @@ public:
    for(unsigned j=0;j<3;++j)bind(constants[i][j],j+1);bind(dummy,4);bind(dummy,5);[enc setBytes:shape length:8 atIndex:6];bind(constants[i][3],9);
    if(i==15){bind(dummy,8);for(unsigned j=0;j<3;++j)bind(j==0&&packedCt?ctPacked:constants[16][j],10+j);bind(dummy,13);bind(output,14);}
    else bind(tensors[i],l.kind==1?8:7);
-   if(l.kind==1||(tiledFnb32&&l.kind==3&&l.channels==32)){groups=(w+7)/8;gy=(h+1)/2;threads=64;}
+   if(l.kind==1||(tiledFnb32&&l.kind==3&&l.channels==32)){groups=(w+7)/8;gy=(l.kind==1&&i!=15)?(h+3)/4:(h+1)/2;threads=64;}
   }else if(l.kind==2){
    for(unsigned j=0;j<3;++j)bind(constants[i][j],j+1);bind(dummy,4);bind(tensors[i],5);[enc setBytes:shape length:8 atIndex:6];
    w/=2;h/=2;divisor*=2;groups=(w*h+7)/8;gy=l.pass==3?4:8;

@@ -5,6 +5,7 @@
 #include <mutex>
 #include <cstdio>
 #include "game_adapter.hpp"
+#include "../../experimental/streamline/game_observer.hpp"
 namespace {
 HMODULE backend=nullptr;
 std::once_flag once;
@@ -24,16 +25,19 @@ FARPROC entry(const char* name) noexcept {
 }
 }
 extern "C" HRESULT WINAPI wfCreateDXGIFactory(REFIID iid,void** out){
+ fsrSlGame::attachCaller(__builtin_return_address(0));
  auto fn=reinterpret_cast<HRESULT(WINAPI*)(REFIID,void**)>(entry("CreateDXGIFactory"));
  if(!fn){if(out)*out=nullptr;return DXGI_ERROR_UNSUPPORTED;}
  const auto hr=fn(iid,out);fprintf(stderr,"FG_DXGI_FACTORY version=0 hr=%08lx\n",(unsigned long)hr);if(SUCCEEDED(hr))wfGameFg::wrapFactory(iid,out);return hr;
 }
 extern "C" HRESULT WINAPI wfCreateDXGIFactory1(REFIID iid,void** out){
+ fsrSlGame::attachCaller(__builtin_return_address(0));
  auto fn=reinterpret_cast<HRESULT(WINAPI*)(REFIID,void**)>(entry("CreateDXGIFactory1"));
  if(!fn){if(out)*out=nullptr;return DXGI_ERROR_UNSUPPORTED;}
  const auto hr=fn(iid,out);fprintf(stderr,"FG_DXGI_FACTORY version=1 hr=%08lx\n",(unsigned long)hr);if(SUCCEEDED(hr))wfGameFg::wrapFactory(iid,out);return hr;
 }
 extern "C" HRESULT WINAPI wfCreateDXGIFactory2(UINT flags,REFIID iid,void** out){
+ fsrSlGame::attachCaller(__builtin_return_address(0));
  auto fn=reinterpret_cast<HRESULT(WINAPI*)(UINT,REFIID,void**)>(entry("CreateDXGIFactory2"));
  if(!fn){if(out)*out=nullptr;return DXGI_ERROR_UNSUPPORTED;}
  const auto hr=fn(flags,iid,out);fprintf(stderr,"FG_DXGI_FACTORY version=2 hr=%08lx\n",(unsigned long)hr);if(SUCCEEDED(hr))wfGameFg::wrapFactory(iid,out);return hr;

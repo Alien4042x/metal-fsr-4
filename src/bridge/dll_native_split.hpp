@@ -2,19 +2,41 @@
 // Splits the application command list around native Metal work and forwards
 // subsequent commands to a continuation list. Only one recording is active.
 #include <array>
+#include <atomic>
 #include <functional>
 #include <vector>
+#include <mutex>
 struct DllNativeSplit {
+ struct CpuTimes {
+  double upstreamSubmit=0,upstreamWait=0,nativeTotal=0,downstreamSubmit=0,completionWait=0;
+  static bool enabled(){static bool value=[](){char v[2]{};return GetEnvironmentVariableA("METAL_FSR4_TRACE",v,2)==1&&v[0]=='1';}();return value;}
+  static long long now(){LARGE_INTEGER t{};QueryPerformanceCounter(&t);return t.QuadPart;}
+  static double ms(long long ticks){static double f=[](){LARGE_INTEGER t{};QueryPerformanceFrequency(&t);return double(t.QuadPart);}();return ticks*1000.0/f;}
+  void report(const void* context){
+   static std::mutex mutex;std::lock_guard<std::mutex> lock(mutex);
+   static unsigned count=0;static double sums[5]{},maxima[5]{};
+   double values[]={upstreamSubmit,upstreamWait,nativeTotal,downstreamSubmit,completionWait};
+   for(unsigned i=0;i<5;++i){sums[i]+=values[i];maxima[i]=std::max(maxima[i],values[i]);}
+   if(++count!=120)return;
+   fprintf(stderr,"BRIDGE_CPU_TIMING scope=all_completed_splits last_split=%p calls=%u window_end_qpc_ms=%.6f upstream_submit_mean_ms=%.6f upstream_submit_max_ms=%.6f upstream_wait_mean_ms=%.6f upstream_wait_max_ms=%.6f native_call_mean_ms=%.6f native_call_max_ms=%.6f downstream_submit_mean_ms=%.6f downstream_submit_max_ms=%.6f completion_wait_mean_ms=%.6f completion_wait_max_ms=%.6f\n",context,count,ms(now()),sums[0]/count,maxima[0],sums[1]/count,maxima[1],sums[2]/count,maxima[2],sums[3]/count,maxima[3],sums[4]/count,maxima[4]);
+   count=0;for(unsigned i=0;i<5;++i)sums[i]=maxima[i]=0;
+  }
+ } cpuTimes;
+
  inline static DllNativeSplit* current=nullptr;
  ID3D12Device* device;ID3D12GraphicsCommandList* head;ID3D12CommandQueue* queue=nullptr;
  ID3D12CommandAllocator* allocator=nullptr;ID3D12GraphicsCommandList* tail=nullptr;ID3D12Fence* fence=nullptr;
  void** originalList;void** originalQueue;
  std::array<void*,81> listTable{};std::array<void*,19> queueTable{};
- std::function<void()> native;bool submitted=false,completed=false;unsigned nativeCalls=0;
+ std::function<void()> native;bool submitted=false,completed=false,abandoned=false;volatile LONG nativeCalls=0;
  unsigned long long seen[2]{};
  // WineForge-Internal: fsr4/continuation-hudless-capture-v1.
  struct ColorState {ID3D12Resource* resource;D3D12_RESOURCE_STATES state;};
- std::vector<ColorState> uiColors;bool captureUi=false;
+ std::vector<ColorState> uiColors;bool captureUi=false,requireEarlyUi=false;
+ inline static std::atomic<unsigned> missingUiBoundaryReports{0};
+ inline static std::atomic<unsigned> capturedUiBoundaryReports{0};
+ float sceneWidth=0,sceneHeight=0;bool fullViewport=false,fullScissor=false,sceneDrawn=false,uiBoundaryCaptured=false;
+ D3D12_CPU_DESCRIPTOR_HANDLE boundRtv{};bool boundRtvValid=false;
  void observeColors(UINT count,const D3D12_RESOURCE_BARRIER* bars){
   if(!captureUi)return;
   for(UINT i=0;i<count;++i){const auto& b=bars[i];if(b.Type!=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION||b.Flags!=D3D12_RESOURCE_BARRIER_FLAG_NONE||b.Transition.Subresource!=D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES)continue;
@@ -23,10 +45,27 @@ struct DllNativeSplit {
   }
  }
  void captureBeforeClose(){
-  if(!captureUi)return;
+  if(!captureUi||requireEarlyUi){
+   if(captureUi&&requireEarlyUi){const auto missing=++missingUiBoundaryReports;if(missing<=4||missing%120==0)printf("FG_HUDLESS_BOUNDARY missing=first_partial_ui fallback=real_frame count=%u\n",missing);}
+   return;
+  }
   using Capture=unsigned(WINAPI*)(ID3D12GraphicsCommandList*,ID3D12Resource*,D3D12_RESOURCE_STATES);
   auto fn=reinterpret_cast<Capture>(GetProcAddress(GetModuleHandleW(L"dxgi.dll"),"WfFgCaptureBeforeUi"));
   if(fn)for(const auto& c:uiColors)if(fn(tail,c.resource,c.state))break;
+ }
+ bool captureAtFirstUi(D3D12_CPU_DESCRIPTOR_HANDLE rtv={}){
+  if(!captureUi||!sceneDrawn||uiBoundaryCaptured||!sceneWidth||!sceneHeight)return false;
+  bool captured=false;
+  if(rtv.ptr){
+   using CaptureRtv=unsigned(WINAPI*)(ID3D12GraphicsCommandList*,ID3D12Device*,D3D12_CPU_DESCRIPTOR_HANDLE);
+   auto fromRtv=reinterpret_cast<CaptureRtv>(GetProcAddress(GetModuleHandleW(L"dxgi.dll"),"WfFgCaptureBeforeUiRtv"));
+   if(fromRtv)captured=fromRtv(tail,device,rtv)!=0;
+  }
+  using Capture=unsigned(WINAPI*)(ID3D12GraphicsCommandList*,ID3D12Resource*,D3D12_RESOURCE_STATES);
+  auto fn=reinterpret_cast<Capture>(GetProcAddress(GetModuleHandleW(L"dxgi.dll"),"WfFgCaptureBeforeUiBoundary"));
+  if(!captured&&fn)for(const auto& c:uiColors)if(fn(tail,c.resource,c.state)){captured=true;break;}
+  if(captured){captureUi=false;uiColors.clear();uiBoundaryCaptured=true;const auto count=++capturedUiBoundaryReports;if(count<=4||count%120==0)printf("FG_HUDLESS_BOUNDARY detected=first_partial_ui count=%u\n",count);}
+  return captured;
  }
 
  // WineForge-Internal: fsr4/bounded-post-upscale-ui-trace-v1.
@@ -48,10 +87,19 @@ struct DllNativeSplit {
  static DllNativeSplit& lookup(ID3D12GraphicsCommandList* list){need(current&&current->head==list,"continuation identity");return *current;}
  void note(unsigned slot,const char* name){traceOperation(slot,name);auto bit=1ull<<(slot%64);if(!(seen[slot/64]&bit)){seen[slot/64]|=bit;printf("CONTINUATION_API slot=%u name=%s\n",slot,name);fflush(stdout);}}
  static HRESULT STDMETHODCALLTYPE forwardClose(ID3D12GraphicsCommandList7 *This){auto& s=lookup(reinterpret_cast<ID3D12GraphicsCommandList*>(This));s.note(9,"Close");s.captureBeforeClose();return s.tail->Close();}
- static HRESULT STDMETHODCALLTYPE forwardReset(ID3D12GraphicsCommandList7 *This, ID3D12CommandAllocator *allocator, ID3D12PipelineState *initial_state){auto& s=lookup(reinterpret_cast<ID3D12GraphicsCommandList*>(This));s.note(10,"Reset");(void)allocator;(void)initial_state;return E_UNEXPECTED;}
+ static HRESULT STDMETHODCALLTYPE forwardReset(ID3D12GraphicsCommandList7 *This, ID3D12CommandAllocator *allocator, ID3D12PipelineState *initial_state){
+  auto& s=lookup(reinterpret_cast<ID3D12GraphicsCommandList*>(This));s.note(10,"Reset");need(!s.submitted,"submitted split reset");
+  // A provider may abandon a generated frame while changing quality mode and
+  // immediately reuse the same command-list object. Restore the real vtable
+  // before forwarding Reset; the owner releases the discarded continuation
+  // when its next callback observes `abandoned`.
+  *reinterpret_cast<void***>(s.head)=s.originalList;s.abandoned=true;current=nullptr;
+  puts("BRIDGE abandoned unsubmitted recording on command-list reset");
+  return s.head->Reset(allocator,initial_state);
+ }
  static void STDMETHODCALLTYPE forwardClearState(ID3D12GraphicsCommandList7 *This, ID3D12PipelineState *pipeline_state){auto& s=lookup(reinterpret_cast<ID3D12GraphicsCommandList*>(This));s.note(11,"ClearState");s.tail->ClearState(pipeline_state);}
- static void STDMETHODCALLTYPE forwardDrawInstanced(ID3D12GraphicsCommandList7 *This, UINT vertex_count_per_instance, UINT instance_count, UINT start_vertex_location, UINT start_instance_location){auto& s=lookup(reinterpret_cast<ID3D12GraphicsCommandList*>(This));s.note(12,"DrawInstanced");s.tail->DrawInstanced(vertex_count_per_instance, instance_count, start_vertex_location, start_instance_location);}
- static void STDMETHODCALLTYPE forwardDrawIndexedInstanced(ID3D12GraphicsCommandList7 *This, UINT index_count_per_instance, UINT instance_count, UINT start_vertex_location, INT base_vertex_location, UINT start_instance_location){auto& s=lookup(reinterpret_cast<ID3D12GraphicsCommandList*>(This));s.note(13,"DrawIndexedInstanced");s.tail->DrawIndexedInstanced(index_count_per_instance, instance_count, start_vertex_location, base_vertex_location, start_instance_location);}
+ static void STDMETHODCALLTYPE forwardDrawInstanced(ID3D12GraphicsCommandList7 *This, UINT vertex_count_per_instance, UINT instance_count, UINT start_vertex_location, UINT start_instance_location){auto& s=lookup(reinterpret_cast<ID3D12GraphicsCommandList*>(This));s.note(12,"DrawInstanced");if((!s.fullViewport||!s.fullScissor)&&s.sceneDrawn)s.captureAtFirstUi(s.boundRtvValid?s.boundRtv:D3D12_CPU_DESCRIPTOR_HANDLE{});s.tail->DrawInstanced(vertex_count_per_instance, instance_count, start_vertex_location, start_instance_location);if(s.fullViewport&&s.fullScissor)s.sceneDrawn=true;}
+ static void STDMETHODCALLTYPE forwardDrawIndexedInstanced(ID3D12GraphicsCommandList7 *This, UINT index_count_per_instance, UINT instance_count, UINT start_vertex_location, INT base_vertex_location, UINT start_instance_location){auto& s=lookup(reinterpret_cast<ID3D12GraphicsCommandList*>(This));s.note(13,"DrawIndexedInstanced");if((!s.fullViewport||!s.fullScissor)&&s.sceneDrawn)s.captureAtFirstUi(s.boundRtvValid?s.boundRtv:D3D12_CPU_DESCRIPTOR_HANDLE{});s.tail->DrawIndexedInstanced(index_count_per_instance, instance_count, start_vertex_location, base_vertex_location, start_instance_location);if(s.fullViewport&&s.fullScissor)s.sceneDrawn=true;}
  static void STDMETHODCALLTYPE forwardDispatch(ID3D12GraphicsCommandList7 *This, UINT x, UINT u, UINT z){auto& s=lookup(reinterpret_cast<ID3D12GraphicsCommandList*>(This));s.note(14,"Dispatch");s.tail->Dispatch(x, u, z);}
  static void STDMETHODCALLTYPE forwardCopyBufferRegion(ID3D12GraphicsCommandList7 *This, ID3D12Resource *dst_buffer, UINT64 dst_offset, ID3D12Resource *src_buffer, UINT64 src_offset, UINT64 byte_count){auto& s=lookup(reinterpret_cast<ID3D12GraphicsCommandList*>(This));s.note(15,"CopyBufferRegion");s.tail->CopyBufferRegion(dst_buffer, dst_offset, src_buffer, src_offset, byte_count);}
  static void STDMETHODCALLTYPE forwardCopyTextureRegion(ID3D12GraphicsCommandList7 *This, const D3D12_TEXTURE_COPY_LOCATION *dst, UINT dst_x, UINT dst_y, UINT dst_z, const D3D12_TEXTURE_COPY_LOCATION *src, const D3D12_BOX *src_box){auto& s=lookup(reinterpret_cast<ID3D12GraphicsCommandList*>(This));s.note(16,"CopyTextureRegion");if(dst)s.traceResource("copy_destination",dst->pResource);if(src)s.traceResource("copy_source",src->pResource);s.tail->CopyTextureRegion(dst, dst_x, dst_y, dst_z, src, src_box);}
@@ -59,8 +107,8 @@ struct DllNativeSplit {
  static void STDMETHODCALLTYPE forwardCopyTiles(ID3D12GraphicsCommandList7 *This, ID3D12Resource *tiled_resource, const D3D12_TILED_RESOURCE_COORDINATE *tile_region_start_coordinate, const D3D12_TILE_REGION_SIZE *tile_region_size, ID3D12Resource *buffer, UINT64 buffer_offset, D3D12_TILE_COPY_FLAGS flags){auto& s=lookup(reinterpret_cast<ID3D12GraphicsCommandList*>(This));s.note(18,"CopyTiles");s.tail->CopyTiles(tiled_resource, tile_region_start_coordinate, tile_region_size, buffer, buffer_offset, flags);}
  static void STDMETHODCALLTYPE forwardResolveSubresource(ID3D12GraphicsCommandList7 *This, ID3D12Resource *dst_resource, UINT dst_sub_resource, ID3D12Resource *src_resource, UINT src_sub_resource, DXGI_FORMAT format){auto& s=lookup(reinterpret_cast<ID3D12GraphicsCommandList*>(This));s.note(19,"ResolveSubresource");s.tail->ResolveSubresource(dst_resource, dst_sub_resource, src_resource, src_sub_resource, format);}
  static void STDMETHODCALLTYPE forwardIASetPrimitiveTopology(ID3D12GraphicsCommandList7 *This, D3D12_PRIMITIVE_TOPOLOGY primitive_topology){auto& s=lookup(reinterpret_cast<ID3D12GraphicsCommandList*>(This));s.note(20,"IASetPrimitiveTopology");s.tail->IASetPrimitiveTopology(primitive_topology);}
- static void STDMETHODCALLTYPE forwardRSSetViewports(ID3D12GraphicsCommandList7 *This, UINT viewport_count, const D3D12_VIEWPORT *viewports){auto& s=lookup(reinterpret_cast<ID3D12GraphicsCommandList*>(This));s.note(21,"RSSetViewports");s.tail->RSSetViewports(viewport_count, viewports);}
- static void STDMETHODCALLTYPE forwardRSSetScissorRects(ID3D12GraphicsCommandList7 *This, UINT rect_count, const D3D12_RECT *rects){auto& s=lookup(reinterpret_cast<ID3D12GraphicsCommandList*>(This));s.note(22,"RSSetScissorRects");s.tail->RSSetScissorRects(rect_count, rects);}
+ static void STDMETHODCALLTYPE forwardRSSetViewports(ID3D12GraphicsCommandList7 *This, UINT viewport_count, const D3D12_VIEWPORT *viewports){auto& s=lookup(reinterpret_cast<ID3D12GraphicsCommandList*>(This));s.note(21,"RSSetViewports");bool full=false;if(viewport_count==1&&viewports){const auto& v=viewports[0];if(v.TopLeftX==0&&v.TopLeftY==0&&v.Width>0&&v.Height>0){if(!s.sceneWidth||(v.Width>=s.sceneWidth&&v.Height>=s.sceneHeight)){s.sceneWidth=v.Width;s.sceneHeight=v.Height;full=true;}else full=v.Width==s.sceneWidth&&v.Height==s.sceneHeight;}}s.fullViewport=full;s.tail->RSSetViewports(viewport_count, viewports);}
+ static void STDMETHODCALLTYPE forwardRSSetScissorRects(ID3D12GraphicsCommandList7 *This, UINT rect_count, const D3D12_RECT *rects){auto& s=lookup(reinterpret_cast<ID3D12GraphicsCommandList*>(This));s.note(22,"RSSetScissorRects");bool full=false;if(rect_count==1&&rects&&s.sceneWidth&&s.sceneHeight){const auto& r=rects[0];full=r.left<=0&&r.top<=0&&r.right>=LONG(s.sceneWidth)&&r.bottom>=LONG(s.sceneHeight);}s.fullScissor=full;s.tail->RSSetScissorRects(rect_count, rects);}
  static void STDMETHODCALLTYPE forwardOMSetBlendFactor(ID3D12GraphicsCommandList7 *This, const FLOAT blend_factor[4]){auto& s=lookup(reinterpret_cast<ID3D12GraphicsCommandList*>(This));s.note(23,"OMSetBlendFactor");s.tail->OMSetBlendFactor(blend_factor);}
  static void STDMETHODCALLTYPE forwardOMSetStencilRef(ID3D12GraphicsCommandList7 *This, UINT stencil_ref){auto& s=lookup(reinterpret_cast<ID3D12GraphicsCommandList*>(This));s.note(24,"OMSetStencilRef");s.tail->OMSetStencilRef(stencil_ref);}
  static void STDMETHODCALLTYPE forwardSetPipelineState(ID3D12GraphicsCommandList7 *This, ID3D12PipelineState *pipeline_state){auto& s=lookup(reinterpret_cast<ID3D12GraphicsCommandList*>(This));s.note(25,"SetPipelineState");s.tail->SetPipelineState(pipeline_state);}
@@ -84,9 +132,9 @@ struct DllNativeSplit {
  static void STDMETHODCALLTYPE forwardIASetIndexBuffer(ID3D12GraphicsCommandList7 *This, const D3D12_INDEX_BUFFER_VIEW *view){auto& s=lookup(reinterpret_cast<ID3D12GraphicsCommandList*>(This));s.note(43,"IASetIndexBuffer");s.tail->IASetIndexBuffer(view);}
  static void STDMETHODCALLTYPE forwardIASetVertexBuffers(ID3D12GraphicsCommandList7 *This, UINT start_slot, UINT view_count, const D3D12_VERTEX_BUFFER_VIEW *views){auto& s=lookup(reinterpret_cast<ID3D12GraphicsCommandList*>(This));s.note(44,"IASetVertexBuffers");s.tail->IASetVertexBuffers(start_slot, view_count, views);}
  static void STDMETHODCALLTYPE forwardSOSetTargets(ID3D12GraphicsCommandList7 *This, UINT start_slot, UINT view_count, const D3D12_STREAM_OUTPUT_BUFFER_VIEW *views){auto& s=lookup(reinterpret_cast<ID3D12GraphicsCommandList*>(This));s.note(45,"SOSetTargets");s.tail->SOSetTargets(start_slot, view_count, views);}
- static void STDMETHODCALLTYPE forwardOMSetRenderTargets(ID3D12GraphicsCommandList7 *This, UINT render_target_descriptor_count, const D3D12_CPU_DESCRIPTOR_HANDLE *render_target_descriptors, WINBOOL single_descriptor_handle, const D3D12_CPU_DESCRIPTOR_HANDLE *depth_stencil_descriptor){auto& s=lookup(reinterpret_cast<ID3D12GraphicsCommandList*>(This));s.note(46,"OMSetRenderTargets");s.tail->OMSetRenderTargets(render_target_descriptor_count, render_target_descriptors, single_descriptor_handle, depth_stencil_descriptor);}
+ static void STDMETHODCALLTYPE forwardOMSetRenderTargets(ID3D12GraphicsCommandList7 *This, UINT render_target_descriptor_count, const D3D12_CPU_DESCRIPTOR_HANDLE *render_target_descriptors, WINBOOL single_descriptor_handle, const D3D12_CPU_DESCRIPTOR_HANDLE *depth_stencil_descriptor){auto& s=lookup(reinterpret_cast<ID3D12GraphicsCommandList*>(This));s.note(46,"OMSetRenderTargets");s.boundRtvValid=render_target_descriptor_count==1&&render_target_descriptors&&render_target_descriptors[0].ptr;s.boundRtv=s.boundRtvValid?render_target_descriptors[0]:D3D12_CPU_DESCRIPTOR_HANDLE{};s.tail->OMSetRenderTargets(render_target_descriptor_count, render_target_descriptors, single_descriptor_handle, depth_stencil_descriptor);}
  static void STDMETHODCALLTYPE forwardClearDepthStencilView(ID3D12GraphicsCommandList7 *This, D3D12_CPU_DESCRIPTOR_HANDLE dsv, D3D12_CLEAR_FLAGS flags, FLOAT depth, UINT8 stencil, UINT rect_count, const D3D12_RECT *rects){auto& s=lookup(reinterpret_cast<ID3D12GraphicsCommandList*>(This));s.note(47,"ClearDepthStencilView");s.tail->ClearDepthStencilView(dsv, flags, depth, stencil, rect_count, rects);}
- static void STDMETHODCALLTYPE forwardClearRenderTargetView(ID3D12GraphicsCommandList7 *This, D3D12_CPU_DESCRIPTOR_HANDLE rtv, const FLOAT color[4], UINT rect_count, const D3D12_RECT *rects){auto& s=lookup(reinterpret_cast<ID3D12GraphicsCommandList*>(This));s.note(48,"ClearRenderTargetView");s.tail->ClearRenderTargetView(rtv, color, rect_count, rects);}
+ static void STDMETHODCALLTYPE forwardClearRenderTargetView(ID3D12GraphicsCommandList7 *This, D3D12_CPU_DESCRIPTOR_HANDLE rtv, const FLOAT color[4], UINT rect_count, const D3D12_RECT *rects){auto& s=lookup(reinterpret_cast<ID3D12GraphicsCommandList*>(This));s.note(48,"ClearRenderTargetView");if(rect_count&&rects)s.captureAtFirstUi(rtv);s.tail->ClearRenderTargetView(rtv, color, rect_count, rects);}
  static void STDMETHODCALLTYPE forwardClearUnorderedAccessViewUint(ID3D12GraphicsCommandList7 *This, D3D12_GPU_DESCRIPTOR_HANDLE gpu_handle, D3D12_CPU_DESCRIPTOR_HANDLE cpu_handle, ID3D12Resource *resource, const UINT values[4], UINT rect_count, const D3D12_RECT *rects){auto& s=lookup(reinterpret_cast<ID3D12GraphicsCommandList*>(This));s.note(49,"ClearUnorderedAccessViewUint");s.tail->ClearUnorderedAccessViewUint(gpu_handle, cpu_handle, resource, values, rect_count, rects);}
  static void STDMETHODCALLTYPE forwardClearUnorderedAccessViewFloat(ID3D12GraphicsCommandList7 *This, D3D12_GPU_DESCRIPTOR_HANDLE gpu_handle, D3D12_CPU_DESCRIPTOR_HANDLE cpu_handle, ID3D12Resource *resource, const float values[4], UINT rect_count, const D3D12_RECT *rects){auto& s=lookup(reinterpret_cast<ID3D12GraphicsCommandList*>(This));s.note(50,"ClearUnorderedAccessViewFloat");s.tail->ClearUnorderedAccessViewFloat(gpu_handle, cpu_handle, resource, values, rect_count, rects);}
  static void STDMETHODCALLTYPE forwardDiscardResource(ID3D12GraphicsCommandList7 *This, ID3D12Resource *resource, const D3D12_DISCARD_REGION *region){auto& s=lookup(reinterpret_cast<ID3D12GraphicsCommandList*>(This));s.note(51,"DiscardResource");s.tail->DiscardResource(resource, region);}
@@ -147,21 +195,38 @@ struct DllNativeSplit {
 
   // Restore physical head interface before giving it to the translation backend.
   *reinterpret_cast<void***>(s.head)=s.originalList;
-  auto original=queueOriginal;original(q,index+1,lists);
-  check(q->Signal(s.fence,1),"bridge upstream signal");HANDLE event=CreateEventW(nullptr,FALSE,FALSE,nullptr);need(event!=nullptr,"bridge event");
-  check(s.fence->SetEventOnCompletion(1,event),"bridge upstream event");DWORD wait=WaitForSingleObject(event,10000);CloseHandle(event);
-  if(wait!=WAIT_OBJECT_0||s.fence->GetCompletedValue()!=1){puts("FAIL bridge upstream timeout");ExitProcess(72);}
-  puts("BRIDGE upstream GPU complete before native");s.native();++s.nativeCalls;
+  auto original=queueOriginal;auto t0=CpuTimes::enabled()?CpuTimes::now():0;original(q,index+1,lists);
+  auto t1=t0?CpuTimes::now():0;
+  check(q->Signal(s.fence,1),"bridge upstream signal");
+  HANDLE event=CreateEventW(nullptr,FALSE,FALSE,nullptr);need(event!=nullptr,"bridge event");
+   check(s.fence->SetEventOnCompletion(1,event),"bridge upstream event");DWORD wait=WaitForSingleObject(event,10000);CloseHandle(event);
+   if(wait!=WAIT_OBJECT_0||s.fence->GetCompletedValue()!=1){
+    // Graceful degradation (was ExitProcess(72)): the upstream GPU work did not
+    // complete in 10s, so the readback inputs are not valid for native. Orphan
+    // the split instead of killing the process: skip native and the tail, keep
+    // the provider's remaining lists flowing. The pair transport's fail-safe
+    // head copy keeps the presented frame clean; FSR upscale frames may show a
+    // stale texture for this pathological frame only.
+    puts("BRIDGE_UPSTREAM_TIMEOUT orphaning split (native and tail skipped)");
+    s.abandoned=true;if(current==&s)current=nullptr;
+    if(index+1<n)original(q,n-index-1,lists+index+1);
+    return;
+   }
+   auto t2=t0?CpuTimes::now():0;
+   puts("BRIDGE upstream GPU complete before native");s.native();InterlockedIncrement(&s.nativeCalls);
+  auto t3=t0?CpuTimes::now():0;
   ID3D12CommandList* continuation[]={s.tail};original(q,1,continuation);check(q->Signal(s.fence,2),"bridge completion fence");puts("BRIDGE native complete before continuation submission");if(index+1<n)original(q,n-index-1,lists+index+1);
   // WineForge-Internal: fsr-lab/detach-completed-list-generation-v1.
   // Only this recording belongs to the insertion. Caller may reset/reuse the
   // physical list before the next FFX dispatch releases our completion resources.
+  if(t0){auto t4=CpuTimes::now();s.cpuTimes.upstreamSubmit=CpuTimes::ms(t1-t0);s.cpuTimes.upstreamWait=CpuTimes::ms(t2-t1);s.cpuTimes.nativeTotal=CpuTimes::ms(t3-t2);s.cpuTimes.downstreamSubmit=CpuTimes::ms(t4-t3);}
   if(current==&s)current=nullptr;
   puts("BRIDGE detached submitted recording; caller list reusable");
  }
- DllNativeSplit(ID3D12Device* d,ID3D12GraphicsCommandList* list,std::function<void()> callback):device(d),head(list),native(callback){
+ DllNativeSplit(ID3D12Device* d,ID3D12GraphicsCommandList* list,std::function<void()> callback,bool uiCaptureAllowed=true):device(d),head(list),native(callback){
   need(!current,"one split observer");
-  char uiOption[2]{};captureUi=GetEnvironmentVariableA("METAL_FG_CAPTURE_HUDLESS",uiOption,2)==1&&uiOption[0]=='1';
+  char uiOption[2]{};captureUi=uiCaptureAllowed&&GetEnvironmentVariableA("METAL_FG_CAPTURE_HUDLESS",uiOption,2)==1&&uiOption[0]=='1';
+  char earlyOption[2]{};requireEarlyUi=GetEnvironmentVariableA("METAL_FG_REQUIRE_EARLY_HUDLESS",earlyOption,2)==1&&earlyOption[0]=='1';
   const unsigned recording=++recordingCount;char traceValue[16]{};
   DWORD traceLength=GetEnvironmentVariableA("METAL_FG_UI_TRACE_FRAME",traceValue,sizeof(traceValue));
   if(traceLength&&traceLength<sizeof(traceValue)&&strtoul(traceValue,nullptr,10)==recording){uiTraceFrame=recording;printf("UI_TRACE begin frame=%u list=%p max_events=512\n",recording,head);}
@@ -247,6 +312,6 @@ struct DllNativeSplit {
   head->AddRef();current=this;*reinterpret_cast<void***>(head)=listTable.data();
   puts("BRIDGE recorded insertion; no GPU submission yet");
  }
- void completion(){need(submitted&&nativeCalls==1,"one native insertion");if(fence->GetCompletedValue()<2){HANDLE e=CreateEventW(nullptr,FALSE,FALSE,nullptr);need(e!=nullptr,"completion event");check(fence->SetEventOnCompletion(2,e),"completion event registration");DWORD w=WaitForSingleObject(e,10000);CloseHandle(e);if(w!=WAIT_OBJECT_0)ExitProcess(83);}completed=true;}
- ~DllNativeSplit(){if(submitted&&!completed)ExitProcess(73);if(current==this){*reinterpret_cast<void***>(head)=originalList;current=nullptr;}if(queue)queue->Release();fence->Release();tail->Release();allocator->Release();head->Release();}
+ void completion(){const UINT64 value=2;auto start=CpuTimes::enabled()?CpuTimes::now():0;if(fence->GetCompletedValue()<value){HANDLE e=CreateEventW(nullptr,FALSE,FALSE,nullptr);need(e!=nullptr,"completion event");check(fence->SetEventOnCompletion(value,e),"completion event registration");DWORD w=WaitForSingleObject(e,10000);CloseHandle(e);if(w!=WAIT_OBJECT_0){puts("BRIDGE_COMPLETION_TIMEOUT orphaning split (was ExitProcess(83))");return;}}need(submitted&&nativeCalls==1,"one successful native insertion");if(start&&!completed){cpuTimes.completionWait=CpuTimes::ms(CpuTimes::now()-start);cpuTimes.report(this);}completed=true;}
+ ~DllNativeSplit(){if(submitted&&!completed)puts("BRIDGE_ORPHAN_SPLIT reason=destroyed_before_completion (was ExitProcess(73); D3D12 defers release until GPU idle)");if(current==this){*reinterpret_cast<void***>(head)=originalList;current=nullptr;}if(queue)queue->Release();fence->Release();tail->Release();allocator->Release();head->Release();}
 };

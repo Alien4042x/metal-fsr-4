@@ -6,6 +6,7 @@
 #include <cmath>
 #include <stdexcept>
 #include "dll_native_transport.hpp"
+#include "fsr4_model_presets.hpp"
 namespace {
 template<class T> struct Com {T* p=nullptr;~Com(){if(p)p->Release();}T** put(){return &p;}};
 constexpr uint32_t supportedFlags = FFX_UPSCALE_ENABLE_HIGH_DYNAMIC_RANGE |
@@ -54,6 +55,8 @@ struct Fsr4D3D12Context::Impl {
         if(!size.width||!size.height||size.width>desc.maxUpscaleSize.width||size.height>desc.maxUpscaleSize.height||
             !request.renderSize.width||!request.renderSize.height||request.renderSize.width>desc.maxRenderSize.width||request.renderSize.height>desc.maxRenderSize.height||
             request.renderSize.width>size.width||request.renderSize.height>size.height)return reject("unsupported logical extent");
+        if((desc.flags&FFX_UPSCALE_ENABLE_DYNAMIC_RESOLUTION)||fsr4ModelForSize(size.width,size.height,request.renderSize.width,request.renderSize.height)==Fsr4ModelPreset::Unsupported)
+            return reject("trained model unavailable for custom/dynamic scale; original provider required");
         if(request.enableSharpening&&(!std::isfinite(request.sharpness)||request.sharpness<0||request.sharpness>1))
             return reject("invalid RCAS sharpness");
         if(!std::isfinite(request.preExposure)||request.preExposure<=0||!std::isfinite(request.jitterOffset.x)||!std::isfinite(request.jitterOffset.y)||
@@ -75,12 +78,12 @@ struct Fsr4D3D12Context::Impl {
             for(unsigned j=0;j<i;++j)if(resources[i]==resources[j])return reject("aliased game resources");
         }
         // Only formats with proven copy/SRV semantics are admitted initially.
-        if(requested[0]!=DXGI_FORMAT_R16G16B16A16_FLOAT&&requested[0]!=DXGI_FORMAT_R32G32B32A32_FLOAT)return reject("color copy format");
-        if(requested[1]!=DXGI_FORMAT_R32_FLOAT&&requested[1]!=DXGI_FORMAT_R24G8_TYPELESS)return reject("depth copy format");
+        if(requested[0]!=DXGI_FORMAT_R16G16B16A16_FLOAT&&requested[0]!=DXGI_FORMAT_R32G32B32A32_FLOAT&&requested[0]!=DXGI_FORMAT_R11G11B10_FLOAT)return reject("color copy format");
+        if(requested[1]!=DXGI_FORMAT_R32_FLOAT&&requested[1]!=DXGI_FORMAT_R24G8_TYPELESS&&requested[1]!=DXGI_FORMAT_R32G8X24_TYPELESS)return reject("depth copy format");
         if(requested[2]!=DXGI_FORMAT_R16G16_FLOAT&&requested[2]!=DXGI_FORMAT_R32G32_FLOAT)return reject("motion copy format");
-        if(requested[3]!=DXGI_FORMAT_R16_FLOAT&&requested[3]!=DXGI_FORMAT_R32_FLOAT)return reject("exposure copy format");
+        if(requested[3]!=DXGI_FORMAT_R16_FLOAT&&requested[3]!=DXGI_FORMAT_R32_FLOAT&&requested[3]!=DXGI_FORMAT_R32G32B32A32_FLOAT)return reject("exposure copy format");
         // Depth/stencil copies require whole subresources with matching extents.
-        if(requested[1]==DXGI_FORMAT_R24G8_TYPELESS){const auto d=resources[1]->GetDesc();
+        if(requested[1]==DXGI_FORMAT_R24G8_TYPELESS||requested[1]==DXGI_FORMAT_R32G8X24_TYPELESS){const auto d=resources[1]->GetDesc();
             if(d.Width!=desc.maxRenderSize.width||d.Height!=desc.maxRenderSize.height)return reject("depth copy capacity mismatch");}
 
   LabNativeFramePacket packet{};auto& a=packet.params;

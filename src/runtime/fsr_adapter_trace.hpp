@@ -12,7 +12,7 @@ static void traceWrite(const char* text){
  if(!WriteFile(traceFile,text,n,&wrote,nullptr)||wrote!=n){CloseHandle(traceFile);traceFile=INVALID_HANDLE_VALUE;}
 }
 static void traceInit(const std::wstring& directory,bool fsr4=false){
- wchar_t name[96];swprintf(name,96,L"wf-fsr-trace-%lu.log",GetCurrentProcessId());
+ wchar_t name[96];swprintf(name,96,L"wf-fsr-trace-%lu-%llu.log",GetCurrentProcessId(),(unsigned long long)GetTickCount64());
  traceFile=CreateFileW((directory+name).c_str(),GENERIC_WRITE,FILE_SHARE_READ,nullptr,CREATE_NEW,FILE_ATTRIBUTE_NORMAL,nullptr);
  traceWrite(fsr4?"WF_FSR_TRACE version=2 provider=fsr4_with_original_fallback max_events=128\n":"WF_FSR_TRACE version=2 provider=original_passthrough max_events=128\n");
 }
@@ -31,7 +31,33 @@ static void traceCreate(ffxContext* c,const ffxCreateContextDescHeader* d,ffxRet
   snprintf(line,sizeof(line),"CREATE context=%p rc=%u flags=0x%x max_render=%ux%u max_upscale=%ux%u\n",c?*c:nullptr,rc,x.flags,x.maxRenderSize.width,x.maxRenderSize.height,x.maxUpscaleSize.width,x.maxUpscaleSize.height);traceWrite(line);}
  ReleaseSRWLockExclusive(&traceLock);
 }
+// Keep descriptor discovery independent of the high-volume upscale trace.
+// Read SDK headers only; unknown extension payloads are never interpreted.
+static void traceDispatchDescriptors(ffxContext* c,const ffxDispatchDescHeader* d){
+ if(!d)return;
+ AcquireSRWLockExclusive(&traceLock);
+ struct Seen {uint64_t root,type;unsigned index;};
+ static Seen seen[64]{};static unsigned count=0;static bool cycleReported=false,depthReported=false;
+ if(traceFile!=INVALID_HANDLE_VALUE&&count<64){
+  const ffxDispatchDescHeader* visited[8]{};const auto* node=d;
+  for(unsigned index=0;node&&index<8;++index){
+   bool cycle=false;for(unsigned j=0;j<index;++j)cycle=cycle||visited[j]==node;
+   if(cycle){if(!cycleReported){traceWrite("FFX_DISPATCH_CHAIN_STOP reason=cycle\n");cycleReported=true;}break;}
+   visited[index]=node;bool known=false;
+   for(unsigned j=0;j<count;++j)known=known||(seen[j].root==d->type&&seen[j].type==node->type&&seen[j].index==index);
+   if(!known){
+    seen[count++]={d->type,node->type,index};char line[256];
+    snprintf(line,sizeof(line),"FFX_DISPATCH_DESCRIPTOR context=%p root=0x%llx index=%u type=0x%llx chained=%u\n",c?*c:nullptr,(unsigned long long)d->type,index,(unsigned long long)node->type,unsigned(node->pNext!=nullptr));traceWrite(line);
+    if(count==64){traceWrite("FFX_DESCRIPTOR_TRACE_LIMIT_REACHED\n");break;}
+   }
+   node=reinterpret_cast<const ffxDispatchDescHeader*>(node->pNext);
+   if(node&&index==7&&!depthReported){traceWrite("FFX_DISPATCH_CHAIN_STOP reason=depth_limit\n");depthReported=true;}
+  }
+ }
+ ReleaseSRWLockExclusive(&traceLock);
+}
 static void traceDispatch(ffxContext* c,const ffxDispatchDescHeader* d){
+ traceDispatchDescriptors(c,d);
  if(!d||d->type!=FFX_API_DISPATCH_DESC_TYPE_UPSCALE)return;
  AcquireSRWLockExclusive(&traceLock);
  ++dispatchCount;
@@ -68,6 +94,14 @@ static void traceConfigure(ffxContext* c,const ffxConfigureDescHeader* d,
   snprintf(line,sizeof(line),"CONFIGURE context=%p type=0x%llx chained=%u rc=%u tracked_upscaler=%u native_disabled=%u\n",
    c?*c:nullptr,static_cast<unsigned long long>(d?d->type:0),unsigned(d&&d->pNext),
    unsigned(rc),unsigned(tracked),unsigned(disabled));traceWrite(line);
+  if(d&&d->type==FFX_API_CONFIGURE_DESC_TYPE_UPSCALE_KEYVALUE){
+   const auto* kv=reinterpret_cast<const ffxConfigureDescUpscaleKeyValue*>(d);
+   snprintf(line,sizeof(line),"CONFIGURE_KEYVALUE key=%llu u64=%llu ptr_bits=%llx\n",
+    (unsigned long long)kv->key,(unsigned long long)kv->u64,(unsigned long long)reinterpret_cast<uintptr_t>(kv->ptr));traceWrite(line);
+   if(kv->key<5&&kv->ptr){float value;memcpy(&value,kv->ptr,sizeof(value));
+    snprintf(line,sizeof(line),"CONFIGURE_FLOAT key=%llu value=%.9g\n",(unsigned long long)kv->key,double(value));traceWrite(line);
+   }
+  }
   if(configurations==128)traceWrite("CONFIGURE_TRACE_LIMIT_REACHED\n");
  }
  ReleaseSRWLockExclusive(&traceLock);

@@ -1,10 +1,14 @@
 # Experiments
 
-`cube/` contains the development scene and supporting AMD SDK files.
-Other directories contain isolated compute variants; their presence does not mean
-they are enabled in the game runtime.
+The development cube and isolated compute tests live here. Some small FG
+transport headers in `rife/`, `metalfx-fg/`, and `streamline/` are also included
+by the current DXGI source. That inclusion does not make those interpolation
+backends qualified game modes.
 
-Build the cube from the project root with `./build.sh dev build`.
-Private AMD 4.1.1 binary experiments remain under
-`.local/workbench/experiments/4.1.1/`. Binary inputs for older builders are stored
-in `.local/binary-inputs/`; compatibility links are excluded from source sharing.
+The full FidelityFX SDK checkout, AMD binaries, model data, generated packages,
+game logs and captured frames remain local inputs outside Git. The repository
+contains a pinned API-header snapshot under `src/vendor/fsr-sdk-2.3.0/`.
+
+The current package builder uses a separately verified native dylib and does
+not reproduce it from this checkout. See the root README and TESTING.md before
+using a candidate in a game.

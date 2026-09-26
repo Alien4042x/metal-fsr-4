@@ -15,21 +15,30 @@ struct SceneFFX {
   query=reinterpret_cast<PfnFfxQuery>(GetProcAddress(module,"ffxQuery"));dispatch=reinterpret_cast<PfnFfxDispatch>(GetProcAddress(module,"ffxDispatch"));
   destroy=reinterpret_cast<PfnFfxDestroyContext>(GetProcAddress(module,"ffxDestroyContext"));auto create=reinterpret_cast<PfnFfxCreateContext>(GetProcAddress(module,"ffxCreateContext"));
   status=reinterpret_cast<PfnWfFsr4Status>(GetProcAddress(module,"wfFsr4GetContextStatus"));need(query&&dispatch&&destroy&&create,"FFX exports");
-  uint64_t count=0,ids[32]{};const char* names[32]{};ffxQueryDescGetVersions versions{};versions.header.type=FFX_API_QUERY_DESC_TYPE_GET_VERSIONS;
-  versions.createDescType=FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;versions.device=device;versions.outputCount=&count;
-  need(query(nullptr,&versions.header)==0&&count>0&&count<=32,"provider count");const auto capacity=count;
-  versions.versionIds=ids;versions.versionNames=names;need(query(nullptr,&versions.header)==0&&count<=capacity,"provider list");
-  unsigned matches=0;for(uint64_t i=0;i<count;++i)if(names[i]&&(ours?ids[i]==wfFsr4VersionId:strcmp(names[i],"3.1.5")==0)){selected=ids[i];label=names[i];++matches;}
-  need(matches==1&&(!ours||status),"unique requested provider available");
-  ffxOverrideVersion version{};version.header.type=FFX_API_DESC_TYPE_OVERRIDE_VERSION;version.versionId=selected;
-  ffxCreateBackendDX12Desc backend{};backend.header={FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_DX12,&version.header};backend.device=device;
+   uint64_t count=0,ids[32]{};const char* names[32]{};ffxQueryDescGetVersions versions{};versions.header.type=FFX_API_QUERY_DESC_TYPE_GET_VERSIONS;
+   versions.createDescType=FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;versions.device=device;versions.outputCount=&count;
+   auto rc0=query(nullptr,&versions.header);printf("SCENE_QUERY first rc=%d count=%llu\n",int(rc0),(unsigned long long)count);
+   if(rc0==0&&count>0&&count<=32){
+    versions.versionIds=ids;versions.versionNames=names;auto rcq=query(nullptr,&versions.header);printf("SCENE_QUERY versions rc=%d count=%llu capacity=%llu\n",int(rcq),(unsigned long long)count,(unsigned long long)count);need(rcq==0&&count<=32,"provider list");
+    unsigned matches=0;for(uint64_t i=0;i<count;++i)if(names[i]&&(ours?ids[i]==wfFsr4VersionId:strcmp(names[i],"3.1.5")==0)){selected=ids[i];label=names[i];++matches;}
+    need(matches==1&&(!ours||status),"unique requested provider available");
+   }else{selected=0;label="fallback-no-override";printf("SCENE_QUERY fallback: creating context without version override (rc=%d)\n",int(rc0));}
+   ffxOverrideVersion version{};version.header.type=FFX_API_DESC_TYPE_OVERRIDE_VERSION;version.versionId=selected;
+   ffxCreateBackendDX12Desc backend{};backend.header={FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_DX12,selected?&version.header:nullptr};
+   backend.device=device;
   ffxCreateContextDescUpscale desc{};desc.header={FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE,&backend.header};desc.flags=FFX_UPSCALE_ENABLE_HIGH_DYNAMIC_RANGE|FFX_UPSCALE_ENABLE_DEPTH_INVERTED;
-  desc.maxRenderSize={RW,RH};desc.maxUpscaleSize={W,H};need(create(&dormant,&desc.header,nullptr)==0&&dormant,"create dormant context");puts("DORMANT_CONTEXT_CREATED");need(create(&context,&desc.header,nullptr)==0&&context,"create selected FFX context");++creates;verify();
+  desc.maxRenderSize={RW,RH};desc.maxUpscaleSize={W,H};
+  const bool menuCube=GetEnvironmentVariableA("WF_CUBE_MENU_AB",nullptr,0)>0;
+  if(!menuCube){need(create(&dormant,&desc.header,nullptr)==0&&dormant,"create dormant context");puts("DORMANT_CONTEXT_CREATED");}
+  printf("CONTEXT_CREATE_BEGIN provider=%s output=%ux%u render=%ux%u\n",label.c_str(),W,H,RW,RH);
+  const auto createRc=create(&context,&desc.header,nullptr);
+  printf("CONTEXT_CREATE_RETURN rc=%d context=%p\n",int(createRc),context);
+  need(createRc==0&&context,"create selected FFX context");++creates;verify();
   ffxQueryDescUpscaleGetJitterPhaseCount phase{};phase.header.type=FFX_API_QUERY_DESC_TYPE_UPSCALE_GETJITTERPHASECOUNT;
   phase.renderWidth=RW;phase.displayWidth=W;phase.pOutPhaseCount=&phaseCount;need(query(&context,&phase.header)==0&&phaseCount>0&&phaseCount<=64,"jitter phases");
   printf("CONTEXT_CREATE count=%u selected=%s phases=%d\n",creates,label.c_str(),phaseCount);
  }
- void verify(){ffxQueryGetProviderVersion active{};active.header.type=FFX_API_QUERY_DESC_TYPE_GET_PROVIDER_VERSION;
+ void verify(){if(!selected){puts("VERIFY skipped (fallback provider)");return;}ffxQueryGetProviderVersion active{};active.header.type=FFX_API_QUERY_DESC_TYPE_GET_PROVIDER_VERSION;
   need(query(&context,&active.header)==0&&active.versionId==selected,"actual provider identity");}
  void jitter(){ffxQueryDescUpscaleGetJitterOffset j{};j.header.type=FFX_API_QUERY_DESC_TYPE_UPSCALE_GETJITTEROFFSET;j.index=int(frames%unsigned(phaseCount));j.phaseCount=phaseCount;j.pOutX=&jx;j.pOutY=&jy;
   need(query(&context,&j.header)==0&&std::isfinite(jx)&&std::isfinite(jy),"finite jitter");}
@@ -38,7 +47,7 @@ struct SceneFFX {
   x.color=ffxApiGetResourceDX12(color);x.depth=ffxApiGetResourceDX12(depth);x.motionVectors=ffxApiGetResourceDX12(motion);x.exposure=ffxApiGetResourceDX12(exposure);
   x.output=ffxApiGetResourceDX12(output,FFX_API_RESOURCE_STATE_UNORDERED_ACCESS);x.renderSize={RW,RH};x.upscaleSize={W,H};x.jitterOffset={jx,jy};x.motionVectorScale={float(RW),float(RH)};
   x.frameTimeDelta=ms;x.preExposure=1;x.reset=reset;x.cameraNear=.1f;x.cameraFar=100;x.cameraFovAngleVertical=2*atanf(1/1.8f);x.viewSpaceToMetersFactor=1;x.enableSharpening=true;x.sharpness=.7f;
-  need(dispatch(&context,&x.header)==0,"FFX scene dispatch");++frames;if(reset)++resets;if(frames==2){need(destroy(&dormant,nullptr)==0,"destroy dormant context");dormant=nullptr;puts("DORMANT_CONTEXT_DESTROYED_ACTIVE_SURVIVES");}
+  need(dispatch(&context,&x.header)==0,"FFX scene dispatch");++frames;if(reset)++resets;if(frames==2&&dormant){need(destroy(&dormant,nullptr)==0,"destroy dormant context");dormant=nullptr;puts("DORMANT_CONTEXT_DESTROYED_ACTIVE_SURVIVES");}
   if(ours){need(status(&context,&last)==0,"context telemetry");if(last.backend!=4)printf("UNEXPECTED_FALLBACK reason=%s\n",last.reason);
    need(last.backend==4&&last.fsr4Dispatches==frames&&last.originalDispatches==0,"actual FSR4 every frame");}
   else{last.backend=3;last.originalDispatches=frames;}

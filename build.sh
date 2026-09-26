@@ -1,105 +1,106 @@
 #!/bin/sh
-# Project-only shell menu; not included in release packages.
+# Project-only menu for the experimental process-scoped Wine package.
 set -eu
-project_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+project_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
 release_dir="$project_dir/release"
-cd "$project_dir"
 
 check_binary() {
-    if [ ! -f "$release_dir/$1" ]; then
-        printf 'Missing file: %s\n' "$release_dir/$1" >&2
+    path="$release_dir/$1"
+    [ -f "$path" ] || { printf 'Missing file: %s\n' "$path" >&2; return 1; }
+    actual=$(od -An -tx1 -N "$2" "$path" | tr -d ' \n')
+    [ "$actual" = "$3" ] || {
+        printf 'Unexpected binary format: %s\n' "$path" >&2
         return 1
-    fi
-    actual=$(od -An -tx1 -N "$2" "$release_dir/$1" | tr -d ' \n')
-    if [ "$actual" != "$3" ]; then
-        printf 'Unexpected binary format: %s\n' "$1" >&2
-        return 1
-    fi
+    }
 }
 
 verify_release() {
     check_binary lib/metal-fsr4.dylib 4 cffaedfe || return 1
-    check_binary lib/wine/x86_64-windows/metal-fsr4.dll 2 4d5a || return 1
-    check_binary game/amd_fidelityfx_loader_dx12.dll 2 4d5a || return 1
-    for name in dxgi.dll amd_fidelityfx_loader_dx12.dll; do
-        if [ -e "$release_dir/lib/wine/x86_64-windows/$name" ]; then
-            printf 'Game wrapper must not be in Wine lib: %s\n' "$name" >&2
-            return 1
-        fi
-    done
-    printf '%s\n' 'Release layout and binary formats verified. Game execution is not tested.'
+    check_binary lib/wine/x86_64-windows/amd_fidelityfx_loader_dx12.dll 2 4d5a || return 1
+    check_binary lib/wine/x86_64-windows/amd_fidelityfx_upscaler_dx12.dll 2 4d5a || return 1
+    check_binary lib/wine/x86_64-windows/amd_fidelityfx_framegeneration_dx12.dll 2 4d5a || return 1
+    check_binary lib/wine/x86_64-windows/dxgi.dll 2 4d5a || return 1
+    builtin_signature=$(od -An -tx1 -j 64 -N 17 \
+        "$release_dir/lib/wine/x86_64-windows/amd_fidelityfx_loader_dx12.dll" | tr -d ' \n')
+    [ "$builtin_signature" = 57696e65206275696c74696e20444c4c00 ] || {
+        printf '%s\n' 'The FidelityFX PE is missing its Wine builtin signature.' >&2
+        return 1
+    }
+    builtin_signature=$(od -An -tx1 -j 64 -N 17 \
+        "$release_dir/lib/wine/x86_64-windows/amd_fidelityfx_framegeneration_dx12.dll" | tr -d ' \n')
+    [ "$builtin_signature" = 57696e65206275696c74696e20444c4c00 ] || {
+        printf '%s\n' 'The frame-generation PE is missing its Wine builtin signature.' >&2
+        return 1
+    }
+    dxgi_signature=$(od -An -tx1 -j 64 -N 17 \
+        "$release_dir/lib/wine/x86_64-windows/dxgi.dll" | tr -d ' \n')
+    [ "$dxgi_signature" != 57696e65206275696c74696e20444c4c00 ] || {
+        printf '%s\n' 'The DXGI PE must be native for a bottle system32 override.' >&2
+        return 1
+    }
+    [ "$(readlink "$release_dir/lib/wine/x86_64-windows/amd_fidelityfx_upscaler_dx12.dll")" = \
+      amd_fidelityfx_loader_dx12.dll ] || {
+        printf '%s\n' 'The upscaler basename must link to the single provider PE.' >&2
+        return 1
+    }
+    [ -f "$release_dir/LICENSE" ] || return 1
+    [ -f "$release_dir/licenses/THIRD-PARTY-NOTICES.txt" ] || return 1
+    if [ -e "$release_dir/game" ] || [ -e "$release_dir/optional-frame-generation" ] ||
+       [ -e "$release_dir/lib/wine/x86_64-windows/metal-fsr4.dll" ] ||
+       [ -e "$release_dir/lib/wine/x86_64-windows/d3d12.dll" ]; then
+        printf '%s\n' 'Unexpected legacy or experimental files in release.' >&2
+        return 1
+    fi
+    printf '%s\n' 'Package layout verified. Wine loading and game behavior are not qualified.'
 }
 
-shell_quote() {
-    printf "'"
-    printf '%s' "$1" | sed "s/'/'\\\\''/g"
-    printf "'"
-}
-
-show_commands() {
-    native_path=$(printf '%s' "$release_dir/lib/metal-fsr4.dylib" | tr '/' '\\')
-    helper_path=$(printf '%s' "$release_dir/lib/wine/x86_64-windows/metal-fsr4.dll" | tr '/' '\\')
-    printf '%s\n' 'For an already configured game wrapper, with FG disabled:' \
-        'export Enabled_Metal_FSR4=1' 'export Enabled_Metal_FG=0' 'export METAL_FSR4_UPGRADE31=1'
-    printf 'export METAL_FSR4_LIBRARY='
-    shell_quote "\??\Z:$native_path"
-    printf '\nexport METAL_FSR4_HELPER='
-    shell_quote "Z:$helper_path"
-    printf '\n%s\n' 'Launch your existing Wine game command from the same shell.' \
-        'The game wrapper needs its original loader beside it as wf_original_fidelityfx_loader_dx12.dll.' \
-        'These commands do not install files. See README.md for installation steps.'
+show_status() {
+    printf '%s\n' \
+        'This is an experimental process-scoped Wine upscaler package.' \
+        'One Wine builtin FidelityFX PE owns the native bridge entry.' \
+        'The alternate FidelityFX basename is a symlink to that same PE.' \
+        'The Metal dylib is a separate runtime input.' \
+        'A separate FG PE observes and forwards calls to the original AMD provider.' \
+        'An opt-in native DXGI proxy supports games without native FG calls.' \
+        'Build and verify do not install into Wine or any game.' \
+        'See README.md and TESTING.md.'
 }
 
 run_choice() {
-    selected=$1
+    choice=$1
     shift
-    case "$selected" in
-        dev)
-            action=${1:-build}
-            if [ "$#" -gt 0 ]; then shift; fi
-            case "$action" in
-                build) python3 "$project_dir/tools/local_workbench.py" build_fg_cube "$@" ;;
-                run) python3 "$project_dir/tools/local_workbench.py" run_fg_cube "$@" ;;
-                *) printf '%s\n' 'Use: ./build.sh dev [build|run] [options]' >&2; return 2 ;;
-            esac
-            return $?
-            ;;
-        --fg-cube)
-            python3 "$project_dir/tools/local_workbench.py" build_fg_cube "$@"
-            return $?
-            ;;
-    esac
     if [ "$#" -ne 0 ]; then
-        printf 'Unexpected arguments for: %s\n' "$selected" >&2
+        printf 'Unexpected arguments for: %s\n' "$choice" >&2
         return 2
     fi
-    case "$selected" in
-        1|build) python3 "$project_dir/tools/local_workbench.py" build_runtime ;;
+    case "$choice" in
+        1|build)
+            sh "$project_dir/experimental/rife/build-clean-release.sh"
+            ;;
         2|verify) verify_release ;;
-        3|commands) show_commands ;;
+        3|status) show_status ;;
         4|exit|quit) exit 0 ;;
         help|--help|-h)
-            printf '%s\n' 'Usage: ./build.sh [build|verify|commands|exit|1|2|3|4]' \
-                'Without arguments: open the interactive menu.' \
-                './build.sh dev [build|run] [options]  Development cube.'
+            printf '%s\n' 'Usage: ./build.sh [build|verify|status|exit]' \
+                'Without arguments: open the interactive menu.'
             ;;
-        *) printf 'Unknown option: %s\n' "$selected" >&2; return 2 ;;
+        *)
+            printf 'Unknown or retired option: %s\n' "$choice" >&2
+            return 2
+            ;;
     esac
 }
 
 if [ "$#" -gt 0 ]; then
-    run_choice "$@"
+    choice=$1
+    shift
+    run_choice "$choice" "$@"
     exit $?
 fi
 while :; do
-    printf '\n'
-    printf '%s\n' '1. Build release       (build)' '2. Verify release      (verify)' \
-        '3. Show launch commands (commands)' '4. Exit                (exit)'
+    printf '\n%s\n' '1. Build candidate' '2. Verify package' '3. Show status' '4. Exit'
     printf 'Choose a number or command: '
-    if ! IFS= read -r choice; then
-        printf '\n'
-        exit 0
-    fi
+    if ! IFS= read -r choice; then printf '\n'; exit 0; fi
     if run_choice "$choice"; then :; else
         printf 'Command failed (%s).\n' "$?" >&2
     fi

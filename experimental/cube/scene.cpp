@@ -36,6 +36,7 @@ static double elapsed(Clock::time_point a,Clock::time_point b){return std::chron
 struct Scene {
  SceneFrameGeneration fg;
  SceneFFX fsr;
+ bool externalFg=false;
  ID3D12Resource* jitterDepth=nullptr;ID3D12PipelineState* colorOnlyPSO=nullptr;
  IDXGIAdapter3* memoryAdapter=nullptr;
  double encodeMs=0,submitWaitMs=0,presentMs=0,reuseWaitMs=0;
@@ -46,14 +47,27 @@ struct Scene {
  std::vector<IUnknown*> owned; bool pending=false; HANDLE event=nullptr;
  ID3D12Device* d=nullptr;ID3D12CommandQueue* q=nullptr;ID3D12CommandAllocator* allocator=nullptr;
  ID3D12GraphicsCommandList* list=nullptr;ID3D12Fence* fence=nullptr;UINT64 serial=0;
- IDXGISwapChain3* swap=nullptr;ID3D12Resource *back[2]={},*depth=nullptr,*vb=nullptr,*hud=nullptr,*readback=nullptr;
+ IDXGISwapChain3* swap=nullptr;ID3D12Resource *back[2]={},*clean[2]={},*ui[2]={},*depth=nullptr,*vb=nullptr,*hud=nullptr,*readback=nullptr,*hudlessReadback=nullptr;
+ bool hudlessCopied=false;
+ bool cleanReadable[2]{},uiReadable[2]{};
  ID3D12Resource *color=nullptr,*motion=nullptr,*upscaled=nullptr;
  ID3D12DescriptorHeap *imageSrv=nullptr;
- ID3D12RootSignature* displayRoot=nullptr;ID3D12PipelineState* displayPSO=nullptr;
+ ID3D12RootSignature* displayRoot=nullptr;ID3D12PipelineState* displayPSO=nullptr,*displayOffsetPSO=nullptr;
  struct Capture {ID3D12Resource* source;ID3D12Resource* buffer;D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp;UINT64 bytes;UINT width,height,channels;const char* name;};
  std::vector<Capture> captures;
  ID3D12DescriptorHeap *rtv=nullptr,*dsv=nullptr;ID3D12RootSignature* root=nullptr;
  ID3D12PipelineState *cubePSO=nullptr,*linePSO=nullptr;UINT rtvStep=0;
+ unsigned generatedCount() const {
+  if(!externalFg){
+   if(fg.nativeProxyTest){using Probe=unsigned(WINAPI*)();auto module=GetModuleHandleW(L"amd_fidelityfx_framegeneration_dx12.dll");
+    auto probe=module?reinterpret_cast<Probe>(GetProcAddress(module,"WfNativeRifeGenerated")):nullptr;
+    return probe?probe():0;}
+   return fg.generatedCallbacks.load();
+  }
+  using Probe=unsigned(WINAPI*)();auto module=GetModuleHandleW(L"dxgi.dll");
+  auto probe=module?reinterpret_cast<Probe>(GetProcAddress(module,"WfFgProbeGenerated")):nullptr;
+  return probe?probe():0;
+ }
  D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint={};UINT64 captureBytes=0;
  template<class T> T* keep(T* p){owned.push_back(p);return p;}
  ~Scene(){if(pending)ExitProcess(90);fg.close();if(fsr.context){try{fsr.close();}catch(...){ExitProcess(91);}}for(auto it=owned.rbegin();it!=owned.rend();++it)(*it)->Release();if(event)CloseHandle(event);}
@@ -74,11 +88,12 @@ struct Scene {
   check(d->GetDeviceRemovedReason(),"device health");submitWaitMs=elapsed(start,Clock::now())*1000;
  }
  void init(HWND window){
+  externalFg=GetEnvironmentVariableA("WF_CUBE_EXTERNAL_FG",nullptr,0)>0;
   IDXGIFactory4* f=nullptr;check(CreateDXGIFactory2(0,IID_PPV_ARGS(&f)),"factory");keep(f);
   IDXGIAdapter1* adapter=nullptr;check(f->EnumAdapters1(0,&adapter),"adapter");keep(adapter);
   if(SUCCEEDED(adapter->QueryInterface(IID_PPV_ARGS(&memoryAdapter))))keep(memoryAdapter);
   DXGI_ADAPTER_DESC1 ad={};adapter->GetDesc1(&ad);printf("ADAPTER %ls (DXGI description)\n",ad.Description);
-  check(D3D12CreateDevice(adapter,D3D_FEATURE_LEVEL_12_0,IID_PPV_ARGS(&d)),"device");keep(d);fg.init(d);
+  check(D3D12CreateDevice(adapter,D3D_FEATURE_LEVEL_12_0,IID_PPV_ARGS(&d)),"device");keep(d);if(!externalFg)fg.init(d);
   D3D12_COMMAND_QUEUE_DESC qd={};check(d->CreateCommandQueue(&qd,IID_PPV_ARGS(&q)),"queue");keep(q);
   check(d->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,IID_PPV_ARGS(&allocator)),"allocator");keep(allocator);
   check(d->CreateCommandList(0,D3D12_COMMAND_LIST_TYPE_DIRECT,allocator,nullptr,IID_PPV_ARGS(&list)),"list");keep(list);check(list->Close(),"initial close");
@@ -88,11 +103,12 @@ struct Scene {
   IDXGISwapChain1* originalSwap=nullptr;
   check(f->CreateSwapChainForHwnd(q,window,&sd,nullptr,nullptr,&originalSwap),"application swap create");
   IDXGISwapChain4* s=nullptr;const auto swapQuery=originalSwap->QueryInterface(IID_PPV_ARGS(&s));originalSwap->Release();check(swapQuery,"application swap4");
-  fg.wrapSwap(s,q);keep(s);
+  if(!externalFg)fg.wrapSwap(s,q);keep(s);
   check(s->QueryInterface(IID_PPV_ARGS(&swap)),"swapchain3");keep(swap);f->MakeWindowAssociation(window,DXGI_MWA_NO_ALT_ENTER);
-  D3D12_DESCRIPTOR_HEAP_DESC hd={};hd.Type=D3D12_DESCRIPTOR_HEAP_TYPE_RTV;hd.NumDescriptors=5;
+  D3D12_DESCRIPTOR_HEAP_DESC hd={};hd.Type=D3D12_DESCRIPTOR_HEAP_TYPE_RTV;hd.NumDescriptors=7;
   check(d->CreateDescriptorHeap(&hd,IID_PPV_ARGS(&rtv)),"RTV heap");keep(rtv);rtvStep=d->GetDescriptorHandleIncrementSize(hd.Type);
   auto handle=rtv->GetCPUDescriptorHandleForHeapStart();for(UINT i=0;i<2;++i){check(swap->GetBuffer(i,IID_PPV_ARGS(&back[i])),"swap buffer");keep(back[i]);d->CreateRenderTargetView(back[i],nullptr,handle);handle.ptr+=rtvStep;}
+  if(fg.hudlessTest){for(UINT i=0;i<2;++i){auto desc=back[i]->GetDesc();desc.Flags=D3D12_RESOURCE_FLAG_NONE;clean[i]=resource(D3D12_HEAP_TYPE_DEFAULT,desc,D3D12_RESOURCE_STATE_COPY_DEST);}}
   hd.Type=D3D12_DESCRIPTOR_HEAP_TYPE_DSV;hd.NumDescriptors=2;check(d->CreateDescriptorHeap(&hd,IID_PPV_ARGS(&dsv)),"DSV heap");keep(dsv);
   D3D12_RESOURCE_DESC dd={};dd.Dimension=D3D12_RESOURCE_DIMENSION_TEXTURE2D;dd.Width=RW;dd.Height=RH;dd.DepthOrArraySize=dd.MipLevels=dd.SampleDesc.Count=1;
   dd.Format=DXGI_FORMAT_R24G8_TYPELESS;dd.Flags=D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;D3D12_CLEAR_VALUE cv={};cv.Format=DXGI_FORMAT_D24_UNORM_S8_UINT;cv.DepthStencil.Depth=0;
@@ -104,7 +120,8 @@ struct Scene {
   color=makeTex(RW,RH,DXGI_FORMAT_R16G16B16A16_FLOAT,D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
   motion=makeTex(RW,RH,DXGI_FORMAT_R16G16_FLOAT,D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
   upscaled=makeTex(W,H,DXGI_FORMAT_R16G16B16A16_FLOAT,D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET|D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
-  for(auto tex:{color,motion,upscaled}){d->CreateRenderTargetView(tex,nullptr,handle);handle.ptr+=rtvStep;}
+  for(auto& texture:ui)texture=makeTex(W,H,DXGI_FORMAT_R8G8B8A8_UNORM,D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+  for(auto tex:{color,motion,upscaled,ui[0],ui[1]}){d->CreateRenderTargetView(tex,nullptr,handle);handle.ptr+=rtvStep;}
   hd.Type=D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;hd.NumDescriptors=1;hd.Flags=D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
   check(d->CreateDescriptorHeap(&hd,IID_PPV_ARGS(&imageSrv)),"display SRV heap");keep(imageSrv);
   D3D12_SHADER_RESOURCE_VIEW_DESC srv={};srv.Format=DXGI_FORMAT_R16G16B16A16_FLOAT;srv.ViewDimension=D3D12_SRV_DIMENSION_TEXTURE2D;
@@ -142,6 +159,8 @@ struct Scene {
   auto fullVs=shader("FullVS","vs_5_0"),fullPs=shader("FullPS","ps_5_0");pd.VS={fullVs->GetBufferPointer(),fullVs->GetBufferSize()};pd.PS={fullPs->GetBufferPointer(),fullPs->GetBufferSize()};
   pd.pRootSignature=displayRoot;pd.InputLayout={};pd.PrimitiveTopologyType=D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
   check(d->CreateGraphicsPipelineState(&pd,IID_PPV_ARGS(&displayPSO)),"display pipeline");keep(displayPSO);
+  auto offsetPs=shader("FullPSOffset","ps_5_0");pd.PS={offsetPs->GetBufferPointer(),offsetPs->GetBufferSize()};
+  check(d->CreateGraphicsPipelineState(&pd,IID_PPV_ARGS(&displayOffsetPSO)),"display offset pipeline");keep(displayOffsetPSO);
   const float xyz[8][3]={{-1,-1,-1},{1,-1,-1},{1,1,-1},{-1,1,-1},{-1,-1,1},{1,-1,1},{1,1,1},{-1,1,1}};
   const UINT faces[6][6]={{0,1,2,0,2,3},{4,6,5,4,7,6},{0,4,5,0,5,1},{3,2,6,3,6,7},{0,3,7,0,7,4},{1,5,6,1,6,2}};
   const float colors[6][3]={{.95f,.22f,.18f},{.12f,.73f,.95f},{.8f,.25f,.9f},{.95f,.77f,.15f},{.16f,.8f,.48f},{.33f,.39f,.97f}};
@@ -149,6 +168,7 @@ struct Scene {
   vb=buffer(vertices.size()*sizeof(V),D3D12_HEAP_TYPE_UPLOAD);void* p=nullptr;D3D12_RANGE empty={};check(vb->Map(0,&empty,&p),"VB map");memcpy(p,vertices.data(),vertices.size()*sizeof(V));vb->Unmap(0,nullptr);
   hud=buffer(512*sizeof(V),D3D12_HEAP_TYPE_UPLOAD);
   auto bd=back[0]->GetDesc();d->GetCopyableFootprints(&bd,0,1,0,&footprint,nullptr,nullptr,&captureBytes);readback=buffer(captureBytes,D3D12_HEAP_TYPE_READBACK);
+  if(GetEnvironmentVariableA("WF_CUBE_VALIDATE_HUDLESS",nullptr,0)>0)hudlessReadback=buffer(captureBytes,D3D12_HEAP_TYPE_READBACK);
   auto captureResource=[&](ID3D12Resource* tex,UINT channels,const char* name){auto desc=tex->GetDesc();Capture c={};c.source=tex;c.width=UINT(desc.Width);c.height=desc.Height;c.channels=channels;c.name=name;
    d->GetCopyableFootprints(&desc,0,1,0,&c.fp,nullptr,nullptr,&c.bytes);c.bytes=UINT64(c.fp.Footprint.RowPitch)*c.height;c.buffer=buffer(c.bytes,D3D12_HEAP_TYPE_READBACK);captures.push_back(c);};
   captureResource(color,4,"input-decoded-rgba32f.bin");captureResource(depth,1,"depth-decoded-r32f.bin");captureResource(motion,2,"motion-decoded-rg32f.bin");captureResource(upscaled,4,"output-decoded-rgba32f.bin");
@@ -165,7 +185,7 @@ struct Scene {
   fsr.init(d);
   printf("READY direct_ffx_cube output=%ux%u render=%ux%u provider=%s vsync=0 inflight_limit=1 flags=0x9 color=10 depth=44 motion=34 exposure=54 output_format=10\n",W,H,RW,RH,fsr.label.c_str());
  }
- void frame(float angle,const std::vector<double>& history,bool capture,float dt,bool reset){
+ void frame(float angle,const std::vector<double>& history,bool capture,float dt,bool reset,bool menuOpen){
   const auto t0=Clock::now();
   fsr.jitter();if(fsr.frames==0)lastAngle=angle;
   std::vector<V> graph;auto line=[&](float x,float y,float xx,float yy,float r,float g,float b){graph.push_back({x,y,0,r,g,b});graph.push_back({xx,yy,0,r,g,b});};
@@ -176,6 +196,9 @@ struct Scene {
   check(allocator->Reset(),"allocator reset");check(list->Reset(allocator,cubePSO),"list reset");UINT i=swap->GetCurrentBackBufferIndex();
   barrier(back[i],D3D12_RESOURCE_STATE_PRESENT,D3D12_RESOURCE_STATE_RENDER_TARGET);
   auto rt=rtv->GetCPUDescriptorHandleForHeapStart();rt.ptr+=i*rtvStep;auto ds=dsv->GetCPUDescriptorHandleForHeapStart();
+  auto uiRt=rtv->GetCPUDescriptorHandleForHeapStart();uiRt.ptr+=(5+i)*rtvStep;
+  if(uiReadable[i])barrier(ui[i],D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_RENDER_TARGET);
+  const float transparent[]={0,0,0,0};list->ClearRenderTargetView(uiRt,transparent,0,nullptr);
   auto cr=rtv->GetCPUDescriptorHandleForHeapStart();cr.ptr+=2*rtvStep;auto mr=cr;mr.ptr+=rtvStep;auto ur=mr;ur.ptr+=rtvStep;
   const float bg[]={.035f,.05f,.08f,1},zero[]={0,0,0,0},sentinel[]={-9,-9,-9,-9};
   list->ClearRenderTargetView(cr,bg,0,nullptr);list->ClearRenderTargetView(mr,zero,0,nullptr);list->ClearRenderTargetView(ur,sentinel,0,nullptr);
@@ -190,7 +213,7 @@ struct Scene {
   barrier(color,D3D12_RESOURCE_STATE_RENDER_TARGET,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);barrier(motion,D3D12_RESOURCE_STATE_RENDER_TARGET,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
   barrier(depth,D3D12_RESOURCE_STATE_DEPTH_WRITE,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);barrier(upscaled,D3D12_RESOURCE_STATE_RENDER_TARGET,D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
   fsr.run(list,color,depth,motion,exposure,upscaled,dt,reset);
-  fg.run(list,depth,motion,fsr.jx,fsr.jy,dt,reset);
+  if(!externalFg&&!fg.nativeProxyTest)fg.run(list,depth,motion,fsr.jx,fsr.jy,dt,reset);
   list->ClearState(nullptr);
   const char eventName[]="continuation regression";
   list->BeginEvent(0,eventName,sizeof(eventName));list->SetMarker(0,eventName,sizeof(eventName));list->EndEvent();
@@ -206,6 +229,50 @@ struct Scene {
   list->OMSetRenderTargets(1,&rt,FALSE,nullptr);list->SetPipelineState(displayPSO);list->SetGraphicsRootSignature(displayRoot);
   ID3D12DescriptorHeap* heaps[]={imageSrv};list->SetDescriptorHeaps(1,heaps);list->SetGraphicsRootDescriptorTable(0,imageSrv->GetGPUDescriptorHandleForHeapStart());
   list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);list->DrawInstanced(3,1,0,0);list->SetGraphicsRootSignature(root);
+  if(fg.hudlessTest){
+   barrier(back[i],D3D12_RESOURCE_STATE_RENDER_TARGET,D3D12_RESOURCE_STATE_COPY_SOURCE);
+   if(cleanReadable[i])barrier(clean[i],D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_COPY_DEST);
+   list->CopyResource(clean[i],back[i]);
+   barrier(clean[i],D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);cleanReadable[i]=true;
+   barrier(back[i],D3D12_RESOURCE_STATE_COPY_SOURCE,D3D12_RESOURCE_STATE_RENDER_TARGET);
+   fg.recordHudless(clean[i]);
+  }
+  // A native FidelityFX game supplies HUD-less color in the same configure
+  // call that selects its generation callback.  Reproduce that contract here
+  // instead of reconfiguring the provider twice per frame.
+  if(fg.nativeProxyTest)fg.run(list,depth,motion,fsr.jx,fsr.jy,dt,reset,clean[i]);
+  if(fg.hudlessTest&&GetEnvironmentVariableA("WF_CUBE_COLOR_SHIFT_TEST",nullptr,0)>0){
+   // Match KCD2's small same-frame difference after the HUD-less capture.
+   list->SetPipelineState(displayOffsetPSO);list->SetGraphicsRootSignature(displayRoot);
+   list->SetGraphicsRootDescriptorTable(0,imageSrv->GetGPUDescriptorHandleForHeapStart());
+   list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);list->DrawInstanced(3,1,0,0);
+   list->SetGraphicsRootSignature(root);
+  }
+  if(menuOpen){
+   const LONG x=LONG(W*.70),left=LONG(W*.73),right=LONG(W*.94);
+   const D3D12_RECT panel={x,LONG(H*.10),LONG(W*.97),LONG(H*.82)};
+   const float dark[]={.04f,.05f,.08f,1},button[]={.16f,.22f,.32f,1},accent[]={.5f,.8f,1,1};
+   list->ClearRenderTargetView(rt,dark,1,&panel);
+   list->ClearRenderTargetView(uiRt,dark,1,&panel);
+   for(int row=0;row<5;++row){const LONG top=LONG(H*(.20+.105*row));const D3D12_RECT box={left,top,right,top+LONG(H*.075)};
+    list->ClearRenderTargetView(rt,row==2?accent:button,1,&box);list->ClearRenderTargetView(uiRt,row==2?accent:button,1,&box);}
+  }
+  if(fg.nativeProxyTest){
+   barrier(ui[i],D3D12_RESOURCE_STATE_RENDER_TARGET,D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);uiReadable[i]=true;
+   fg.registerUi(ffxApiGetResourceDX12(ui[i],FFX_API_RESOURCE_STATE_PIXEL_READ),
+                 FFX_FRAMEGENERATION_UI_COMPOSITION_FLAG_USE_PREMUL_ALPHA);
+  }
+  if(capture&&externalFg&&hudlessReadback){
+   using Probe=ID3D12Resource*(WINAPI*)(ID3D12Device*);
+   auto module=GetModuleHandleW(L"dxgi.dll");auto probe=module?reinterpret_cast<Probe>(GetProcAddress(module,"WfFgProbeHudless")):nullptr;
+   ID3D12Resource* scene=probe?probe(d):nullptr;
+   if(scene){
+    barrier(scene,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_COPY_SOURCE);
+    D3D12_TEXTURE_COPY_LOCATION destination{},source{};destination.pResource=hudlessReadback;destination.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;destination.PlacedFootprint=footprint;
+    source.pResource=scene;source.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;list->CopyTextureRegion(&destination,0,0,0,&source,nullptr);
+    barrier(scene,D3D12_RESOURCE_STATE_COPY_SOURCE,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);scene->Release();hudlessCopied=true;
+   }
+  }
   settings[2]=1;list->SetGraphicsRoot32BitConstants(0,8,settings,0);list->SetPipelineState(linePSO);view={hud->GetGPUVirtualAddress(),UINT(graph.size()*sizeof(V)),sizeof(V)};
   list->IASetVertexBuffers(0,1,&view);list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_LINELIST);/* HUD graph omitted from interpolation input; window title remains. */
   if(capture){barrier(back[i],D3D12_RESOURCE_STATE_RENDER_TARGET,D3D12_RESOURCE_STATE_COPY_SOURCE);
@@ -220,7 +287,7 @@ struct Scene {
   const double primarySubmitWaitMs=submitWaitMs;puts("REUSE_BEGIN same_list new_recording no_FSR");
   check(allocator->Reset(),"reuse allocator");check(list->Reset(allocator,nullptr),"reuse list");
   list->SetMarker(0,"reuse",6);finish();reuseWaitMs=submitWaitMs;submitWaitMs=primarySubmitWaitMs;puts("REUSE_COMPLETE original_submission_no_native");
-  const auto presentStart=Clock::now();check(fg.presentFrame(0,0),"present");presentMs=elapsed(presentStart,Clock::now())*1000;lastAngle=angle;
+  const auto presentStart=Clock::now();check(externalFg?swap->Present(0,0):fg.presentFrame(0,0),"present");presentMs=elapsed(presentStart,Clock::now())*1000;lastAngle=angle;
 
  }
  static float decodeHalf(uint16_t v){const int e=(v>>10)&31,m=v&1023;const float sign=v&0x8000?-1.f:1.f;
@@ -261,6 +328,13 @@ struct Scene {
   fclose(f);D3D12_RANGE empty={};readback->Unmap(0,&empty);need(ok,"capture write");need(colored>W*H/50&&colored<W*H/2,"nonblank cube coverage");
   printf("CAPTURE rgba8=%u colored_pixels=%zu\n",W*H*4,colored);
  }
+ void exportHudless(const std::wstring& path){
+  need(hudlessCopied&&hudlessReadback,"HUD-less probe did not capture");
+  void* p=nullptr;D3D12_RANGE range={0,SIZE_T(captureBytes)};check(hudlessReadback->Map(0,&range,&p),"HUD-less probe map");
+  FILE* f=_wfopen(path.c_str(),L"wb");need(f!=nullptr,"HUD-less probe file");bool ok=true;
+  for(UINT y=0;y<H;++y){auto row=static_cast<const unsigned char*>(p)+size_t(y)*footprint.Footprint.RowPitch;if(fwrite(row,1,W*4,f)!=W*4)ok=false;}
+  fclose(f);D3D12_RANGE empty{};hudlessReadback->Unmap(0,&empty);need(ok,"HUD-less probe write");
+ }
 };
 // Optional counters are sampled once per second; unavailable is encoded as NA.
 struct MemorySample {
@@ -280,34 +354,47 @@ static unsigned option(const char* name,unsigned fallback,unsigned lo,unsigned h
 static int runScene(HWND window,HWND canvas,HWND label,const std::wstring& base){FILE* csv=nullptr;
  try{
   csv=_wfopen((base+L"\\frames.csv").c_str(),L"wx");need(csv!=nullptr,"exclusive frames CSV");setvbuf(csv,nullptr,_IOLBF,0);
-  fprintf(csv,"frame,elapsed_s,wall_frame_ms,encode_ms,submit_wait_ms,present_ms,backend,fsr4_dispatches,original_dispatches,allocated_bytes,context_creates,context_destroys,submitted_fence,completed_fence,outstanding,capture,capture_io_ms,reset,angle,process_working_set,process_private,local_usage,local_budget,nonlocal_usage,nonlocal_budget,memory_sample,reuse_wait_ms\n");
+  fprintf(csv,"frame,elapsed_s,wall_frame_ms,encode_ms,submit_wait_ms,present_ms,backend,fsr4_dispatches,original_dispatches,allocated_bytes,context_creates,context_destroys,submitted_fence,completed_fence,outstanding,capture,capture_io_ms,reset,angle,process_working_set,process_private,local_usage,local_budget,nonlocal_usage,nonlocal_budget,memory_sample,reuse_wait_ms,menu_open,real_callbacks,generated_callbacks\n");
   Scene s;const auto initStart=Clock::now();s.init(canvas);printf("INITIALIZED seconds=%.6f\n",elapsed(initStart,Clock::now()));
   const auto start=Clock::now();auto previous=start;MemorySample memory;std::vector<double> history,measured;unsigned frames=0;uint64_t firstAllocation=0;
+  const bool menuAB=GetEnvironmentVariableA("WF_CUBE_MENU_AB",nullptr,0)>0;
+  const unsigned captureFrame=option("WF_CUBE_CAPTURE_FRAME",10001,0,10000);
+  char speedText[32]{};DWORD speedLength=GetEnvironmentVariableA("WF_CUBE_ANGLE_SPEED",speedText,sizeof(speedText));
+  float angleSpeed=1.2f;
+  if(speedLength){char* end=nullptr;angleSpeed=strtof(speedText,&end);
+   need(speedLength<sizeof(speedText)&&end&&!*end&&std::isfinite(angleSpeed)&&angleSpeed>=.01f&&angleSpeed<=2.f,
+        "bounded cube angle speed");}
   while(frames<MaxFrames&&elapsed(start,Clock::now())<MaxSeconds&&!stopRequested){
    const auto frameStart=Clock::now();const double previousAuxMs=elapsed(previous,frameStart)*1000;
    const bool smallGate=MaxFrames==8;
    const bool reset=frames==0||(smallGate&&frames==6);
-   const bool capture=frames==4||(smallGate?frames==6:(s.captureCount==1&&elapsed(start,Clock::now())>=MaxSeconds*.75));
-   const float angle=float(frames)*(.65f/60);s.frame(angle,history,capture,16.667f,reset);
-   const auto copyStart=Clock::now();if(capture){const auto prefix=base+(frames==4?L"\\moving":smallGate?L"\\reset":L"\\late");s.exportFrame(prefix+L"-scene-rgba8.bin");s.exportResources(prefix);}
+   const bool capture=(frames==captureFrame)||
+      (!menuAB&&(frames==4||(smallGate?frames==6:(s.captureCount==1&&elapsed(start,Clock::now())>=MaxSeconds*.75))));
+   const double sceneSeconds=elapsed(start,Clock::now());
+   const bool menuOpen=menuAB&&sceneSeconds>=4&&sceneSeconds<8;
+   const float angle=menuAB?float(sceneSeconds*angleSpeed):float(frames)*(.65f/60);
+   s.frame(angle,history,capture,16.667f,reset,menuOpen);
+   const auto copyStart=Clock::now();if(capture){const auto prefix=base+(frames==4?L"\\moving":smallGate?L"\\reset":L"\\late");s.exportFrame(prefix+L"-scene-rgba8.bin");if(s.hudlessReadback)s.exportHudless(prefix+L"-hudless-rgba8.bin");s.exportResources(prefix);}
    const double copyMs=capture?elapsed(copyStart,Clock::now())*1000:0;
    const auto now=Clock::now();const double t=elapsed(start,now),ms=elapsed(previous,now)*1000;previous=now;
    const auto memoryStart=Clock::now();const bool sampled=memory.update(s,t);const double memoryMs=elapsed(memoryStart,Clock::now())*1000;const auto completed=s.fence->GetCompletedValue();need(completed==s.serial,"no unbounded queue backlog");
    if(s.fsr.ours){if(!frames)firstAllocation=s.fsr.last.allocatedBytes;need(s.fsr.last.allocatedBytes==firstAllocation,"stable port allocation");}
-   fprintf(csv,"%u,%.6f,%.6f,%.6f,%.6f,%.6f,%u,%llu,%llu,%s,%u,%u,%llu,%llu,%llu,%u,%.6f,%u,%.9f,%s,%s,%s,%s,%s,%s,%u,%.6f\n",
+   fprintf(csv,"%u,%.6f,%.6f,%.6f,%.6f,%.6f,%u,%llu,%llu,%s,%u,%u,%llu,%llu,%llu,%u,%.6f,%u,%.9f,%s,%s,%s,%s,%s,%s,%u,%.6f,%u,%u,%u\n",
     frames,t,ms,s.encodeMs,s.submitWaitMs,s.presentMs,s.fsr.last.backend,
     static_cast<unsigned long long>(s.fsr.last.fsr4Dispatches),static_cast<unsigned long long>(s.fsr.last.originalDispatches),s.fsr.ours?std::to_string(s.fsr.last.allocatedBytes).c_str():"NA",s.fsr.creates,s.fsr.destroys,
     static_cast<unsigned long long>(s.serial),static_cast<unsigned long long>(completed),static_cast<unsigned long long>(s.serial-completed),capture,copyMs,reset,angle,
-    memory.working.c_str(),memory.privateBytes.c_str(),memory.local.c_str(),memory.budget.c_str(),memory.nonlocal.c_str(),memory.nonlocalBudget.c_str(),sampled,s.reuseWaitMs);
+    memory.working.c_str(),memory.privateBytes.c_str(),memory.local.c_str(),memory.budget.c_str(),memory.nonlocal.c_str(),memory.nonlocalBudget.c_str(),sampled,s.reuseWaitMs,unsigned(menuOpen),s.fg.realCallbacks.load(),s.generatedCount());
    ++frames;history.push_back(ms);if(history.size()>180)history.erase(history.begin());if(frames>5&&!capture)measured.push_back(ms);
    const auto uiStart=Clock::now();
    if(frames==1||sampled){double total=0;for(auto v:history)total+=v;const double avg=total/history.size();wchar_t text[256];
-    swprintf(text,256,L"Direct FFX | %u x %u -> %u x %u | %.1f FPS | %.2f ms | backend %u\nVSync OFF | graph 0..200 ms | one in-flight frame",RW,RH,W,H,1000/avg,avg,s.fsr.last.backend);SetWindowTextW(label,text);
-    swprintf(text,256,L"Direct FFX cube | %.1f FPS | backend %u",1000/avg,s.fsr.last.backend);SetWindowTextW(window,text);}
+    swprintf(text,256,L"Direct FFX | %u x %u -> %u x %u | %.1f real FPS | %.2f ms | backend %u\nMenu %ls | FG generated %u | VSync OFF",RW,RH,W,H,1000/avg,avg,s.fsr.last.backend,menuOpen?L"OPEN":L"CLOSED",s.generatedCount());SetWindowTextW(label,text);
+    swprintf(text,256,L"Direct FFX cube | %.1f real FPS | menu %ls",1000/avg,menuOpen?L"OPEN":L"CLOSED");SetWindowTextW(window,text);}
    const double uiMs=elapsed(uiStart,Clock::now())*1000;
    printf("SCENE_AUX_TIMING frame=%u work_ms=%.6f previous_aux_ms=%.6f memory_ms=%.6f ui_ms=%.6f\n",frames-1,elapsed(frameStart,now)*1000-copyMs,previousAuxMs,memoryMs,uiMs);
   }
-  const bool cancelled=stopRequested;need(cancelled||(frames>=8&&s.captureCount==2),"completed frames and captures");s.fg.drain();need(s.fg.generatedCallbacks>0,"generated presentation callbacks");s.fsr.verify();s.fsr.close();
+  const bool cancelled=stopRequested;need(cancelled||(frames>=8&&(menuAB||s.captureCount==2)),"completed frames and captures");
+  if(s.externalFg){using Drain=unsigned(WINAPI*)();auto module=GetModuleHandleW(L"dxgi.dll");auto drain=module?reinterpret_cast<Drain>(GetProcAddress(module,"WfFgProbeDrain")):nullptr;need(drain!=nullptr,"external FG drain export");drain();}
+  else s.fg.drain();need(s.generatedCount()>0,"generated frame outputs");s.fsr.verify();s.fsr.close();
   printf("%s direct_ffx_cube frames=%u captures=%u duration_s=%.6f contexts_created=%u contexts_destroyed=%u inflight_limit=1\n",cancelled?"CANCELLED":"PASS",frames,s.captureCount,elapsed(start,Clock::now()),s.fsr.creates,s.fsr.destroys);
   fclose(csv);return cancelled?2:0;
  }catch(const std::exception& e){printf("FAIL direct_ffx_cube %s\n",e.what());if(csv)fclose(csv);return 1;}

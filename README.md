@@ -1,273 +1,151 @@
-# Metal FSR 4
+# Metal FSR 4 workbench
 
-An experimental Metal implementation of the FSR 4.0.2 neural upscaler, connected
-to D3D12 applications through a FidelityFX wrapper. The neural network executes
-with Metal shaders and model weights. This path does not use MetalFX as its upscaler.
+This repository contains an experimental Metal execution path for the FSR
+4.0.2 upscaling network and a FidelityFX/D3D12 bridge for Wine. The local
+package is a test candidate. It has not been qualified in a game with the new
+loading method.
 
-Frame generation uses AMD's original 3.1.6 provider and the 3.1.7 interpolation
-swapchain from FidelityFX SDK 2.3.0. The wrapper supplies frame resources and
-coordinates presentation. An experimental HUD-less capture path protects UI
-from interpolation and uses two buffers for asynchronous frame generation.
+## Local package
 
-## Project layout
-
-| Directory | Contents |
-| --- | --- |
-| `src/runtime/` | FidelityFX provider, Metal inference and temporal reconstruction |
-| `src/bridge/` | D3D12 resource transfers, command forwarding and synchronization |
-| `src/dxgi/` | DXGI forwarding, AMD frame generation and HUD-less capture |
-| `src/shaders/` | Metal shaders copied from the last tested game candidate |
-| `src/vendor/` | Pinned AMD SDK headers and dependency hashes |
-| `experimental/` | Development cube and isolated compute experiments |
-| `licenses/` | Consolidated third-party license notices |
-| `tools/` | Entry point for local build and test tools |
-
-Private dependencies, game DLLs, model data, results and working notes are stored
-under `.local/`. They are not part of the source material intended for sharing.
-
-## Building
-
-The current build uses macOS, Xcode's command-line tools, Python 3 and LLVM-MinGW.
-Toolchain locations and test inputs still depend on the local development setup;
-this is not yet a standalone build from a fresh checkout.
-
-Run from the project directory:
-
-```sh
-./build.sh build
-```
-
-This builds the runtime without the development cube into the ignored local
-`release/` directory:
+`./build.sh build` assembles the ignored `release/` directory:
 
 ```text
-lib/
-├── metal-fsr4.dylib
-└── wine/x86_64-windows/
-    └── metal-fsr4.dll
-game/
-└── amd_fidelityfx_loader_dx12.dll
-optional-frame-generation/
-├── amd_fidelityfx_framegeneration_dx12.dll
-├── dxgi.dll
-└── README.txt
-LICENSE
-licenses/
+release/
+├── lib/metal-fsr4.dylib
+├── lib/wine/x86_64-windows/amd_fidelityfx_loader_dx12.dll
+├── lib/wine/x86_64-windows/amd_fidelityfx_upscaler_dx12.dll -> amd_fidelityfx_loader_dx12.dll
+├── lib/wine/x86_64-windows/amd_fidelityfx_framegeneration_dx12.dll
+├── lib/wine/x86_64-windows/dxgi.dll
+├── LICENSE
+└── licenses/THIRD-PARTY-NOTICES.txt
 ```
 
-The `optional-frame-generation/` directory is a separate per-application integration.
-Never overwrite Wine's original `dxgi.dll` with this proxy. It needs application
-DLL overrides and an explicit path to the original DXGI backend; copying the
-whole release into Wine does not configure FG. Leave `Enabled_Metal_FG=0` until
-that integration is configured.
+The upscaler PE exports the FidelityFX API and the native Metal bridge entry,
+`LabFullFrame`. Its second DLL name is a symlink because games request
+different FidelityFX basenames. The separate frame-generation PE observes
+FidelityFX calls and forwards them to the game's original AMD FG provider; it
+does not generate frames itself. Wine's `winebuild --builtin` marks both PE
+payloads so a process can select them through `WINEDLLPATH` and
+`WINEDLLOVERRIDES`. The optional DXGI proxy is an ordinary native PE, selected
+from bottle `system32` with a process-specific `dxgi=n,b` override for games
+that do not call FidelityFX FG themselves. It delegates normal DXGI calls to
+the original D3DMetal DLL. No game DLL or `d3d12.dll` is replaced.
 
-The package contains no Python scripts or installer. Copy the main `lib/` libraries into the
-corresponding Wine runtime locations as appropriate for your integration. PE
-placement, DLL overrides and the path used to load the native library still need
-to match that runtime; Wine does not automatically load an arbitrary dylib merely
-because it is in `lib/`. Building does not install files into Wine or a game.
-
-A new build is an unqualified candidate. The current full builder still takes
-shader and weight inputs from its pinned private baseline; it does not yet build
-directly from `src/shaders/`. Do not assume a fresh build reproduces the last tested
-game candidate or its performance.
-
-## Game wrapper
-
-`game/amd_fidelityfx_loader_dx12.dll` replaces the game's FidelityFX loader;
-it is not a Wine system DLL. The current wrapper also requires the game's own
-original loader beside it as `wf_original_fidelityfx_loader_dx12.dll`. That file
-comes from the game installation and is deliberately not distributed. Do not
-replace the game loader unless its original is retained under the required name.
-The AMD frame generation DLL is a separate provider, not that original loader.
-
-`lib/wine/x86_64-windows/metal-fsr4.dll` is the PE bridge to the native dylib.
-Neither it nor the dylib is automatically enabled by copying it into Wine.
-
-Run `./build.sh` in the project for the English shell menu. Enter `1`–`4` or
-`build`, `verify`, `commands`, `exit`. Commands also work directly:
+The Metal dylib is retained from a verified local input (SHA-256
+`1409d0809efb5a283cbfbf2dfe2b1362a25e24b235f2236c34251f53d6811a45`).
+The native source has changed since that binary was built. A fresh native
+build and game-level image and performance checks are required before a
+published release.
 
 ```sh
 ./build.sh build
 ./build.sh verify
-./build.sh commands
+./build.sh status
 ```
 
-The menu itself uses POSIX shell, not Python, and is not included in release
-packages. The existing build tooling still requires Python 3.
+Building archives the preceding local package under `.local/workbench/archives/`.
+It does not install into Wine, a bottle, or a game. `verify` checks the package
+layout and binary formats; it does not validate rendering.
 
-## Manual installation (upscaling only)
+## Process-scoped loading
 
-| File | Placement and purpose |
-| --- | --- |
-| `release/lib/metal-fsr4.dylib` | Native Metal implementation with embedded shaders and weights. Keep here or copy to `<wine-runtime>/lib/`; `METAL_FSR4_LIBRARY` must point to its actual location. |
-| `release/lib/wine/x86_64-windows/metal-fsr4.dll` | Windows-to-native bridge. Keep here or copy to `<wine-runtime>/lib/wine/x86_64-windows/`; `METAL_FSR4_HELPER` must point to its actual location. |
-| `release/game/amd_fidelityfx_loader_dx12.dll` | Our game wrapper. Copy beside the game's original loader after the rename described below. Do not install as a global Wine loader. |
-| `wf_original_fidelityfx_loader_dx12.dll` | The game's own original loader after renaming; keep beside our wrapper. Not supplied in release. |
-| `release/optional-frame-generation/` | Separate experimental FG integration. Not required for upscaling alone; do not merge its DXGI proxy into Wine's libraries. |
-
-`<wine-runtime>` means the Wine engine installation, not a game's Wine prefix or
-its `drive_c/windows/system32` directory. Runtime layouts can differ: the explicit
-library paths determine what is loaded. Copying files does not enable them.
-
-
-Building creates `release/`; it does not install into a game, rename the original
-loader or configure Wine. For a game using `amd_fidelityfx_loader_dx12.dll`:
-
-1. Close the game. Find its existing `amd_fidelityfx_loader_dx12.dll` in the game
-   installation, not in the Wine runtime.
-2. On the first installation, rename that original game file to
-   `wf_original_fidelityfx_loader_dx12.dll` in the same directory. It is both the
-   preserved original and an active dependency: the wrapper loads it at runtime.
-   Do not use the AMD frame generation DLL in its place.
-3. Copy `release/game/amd_fidelityfx_loader_dx12.dll` into that game directory,
-   alongside the renamed original.
-4. Keep `lib/metal-fsr4.dylib` and
-   `lib/wine/x86_64-windows/metal-fsr4.dll` in the release directory, or place them
-   in your chosen Wine runtime. Set the paths below to their actual locations.
-5. Apply the environment settings in the same shell or launcher that starts the
-   game. Keep FG disabled for this installation. Use your existing working
-   Wine/GPTK game launch command and prefix.
-
-For an update, replace only the previously installed wrapper with the new wrapper.
-Never rename our wrapper to `wf_original_fidelityfx_loader_dx12.dll` or overwrite
-a retained original with it. If the original is missing or its identity is unclear,
-restore the game's original loader from a verified game installation first. After
-a game update, ensure the retained original matches that game version.
-
-Example paths below assume the release is at `/path/to/release` and Wine's `Z:`
-drive maps the macOS filesystem. Replace those paths before use:
+`fsr-hook.command` wraps the command that starts a game. It requires
+`WINEPREFIX` and the absolute path to that game's untouched original
+FidelityFX DLL. For a game that loads `amd_fidelityfx_loader_dx12.dll`, use:
 
 ```sh
-export Enabled_Metal_FSR4=1
-export Enabled_Metal_FG=0
-export METAL_FSR4_UPGRADE31=1
-export METAL_FSR4_LIBRARY='\??\Z:\path\to\release\lib\metal-fsr4.dylib'
-export METAL_FSR4_HELPER='Z:\path\to\release\lib\wine\x86_64-windows\metal-fsr4.dll'
+WINEPREFIX=/path/to/bottle ./fsr-hook.command \
+  --loader loader \
+  --original '/path/to/bottle/drive_c/path/to/game/amd_fidelityfx_loader_dx12.dll' \
+  --upgrade31 \
+  -- /path/to/wine 'C:\path\to\game.exe'
 ```
 
-Then run your usual game launch command from that shell. The project menu's
-**Show launch commands** option prints paths for the current local release.
-`METAL_FSR4_LIBRARY` identifies the native dylib, using the `\??\Z:` path
-form expected by the bridge. `METAL_FSR4_HELPER` identifies the PE bridge DLL,
-using a `Z:` Windows path. The menu derives these from the project location;
-they are not hard-coded to a particular account. Once copied into your launch
-settings, they are absolute paths: update them if you move either library.
-These settings do not install the wrapper or select a Wine prefix themselves.
-If your launcher requires DLL overrides to load the game-local wrapper, configure
-those for this application only, preserving its existing graphics backend settings.
+For a game that loads `amd_fidelityfx_upscaler_dx12.dll`, use
+`--loader upscaler` and point `--original` at that DLL. Omit `--upgrade31`
+unless the game requests FSR 3.1 and you explicitly want the experimental
+4.0.2 upgrade. The wrapped command must pass its environment to the actual
+game process. Merely running `fsr-hook.command` separately does not change an
+already running game or Steam process.
 
-Do not copy `optional-frame-generation/dxgi.dll` over Wine's original DXGI.
-FG needs separate presentation integration; setting `Enabled_Metal_FG=1` alone
-does not configure it. This manual procedure enables only the upscaling path and
-does not establish game compatibility or qualify a newly built release.
+To observe a game's existing AMD frame generation in the same process, add
+`--fg-observe --fg-original /absolute/path/to/amd_fidelityfx_framegeneration_dx12.dll`.
+The FG DLL must be the untouched original inside the selected prefix's
+`drive_c`. This option does not enable FG in the game, substitute MetalFX or
+RIFE, or advertise a newer AMD FG version.
 
-To remove the game wrapper, close the game, remove our installed
-`amd_fidelityfx_loader_dx12.dll`, and rename the retained original back to
-`amd_fidelityfx_loader_dx12.dll`. Remove the launch settings as well.
+KCD2 did not load any AMD FG DLL when its original upscaler was selected, even
+though the upscaler itself ran. For this kind of game, `--fg-present` adds the
+DXGI presentation bridge. It requires `--fg-observe` and the original FG path
+above. The native `release/lib/wine/x86_64-windows/dxgi.dll` must first be
+installed as `<bottle>/drive_c/windows/system32/dxgi.dll`, after saving that
+bottle's original DXGI DLL. This is a one-time bottle installation, not a game
+file. The launcher checks that the installed copy matches the local package;
+it will not overwrite the bottle automatically. With `--fg-present`, the
+launcher selects this proxy only for its wrapped Wine process and temporarily
+copies the original D3DMetal DXGI DLL for safe delegation. The bottle file is
+still shared by other programs that independently choose native-first DXGI.
+For non-WineForge runtimes, pass `--dxgi-original` with the full path to their
+original DXGI DLL. CrossOver has not been tested with this path.
 
-## Runtime switches
+The launcher sets `WINEDLLPATH` to the package and a builtin-first override
+for the game's requested FidelityFX name. It makes a distinct temporary copy
+of the untouched original DLL and adds a path-specific native-first override
+under `Z:` so other FidelityFX calls can delegate to it. When FG observation
+is enabled, its original DLL is copied the same way. The copies are created
+with APFS copy-on-write where available and removed when the wrapped command
+exits. The launcher does not alter game files; `--fg-present` does require the
+separate bottle-level DXGI installation described above. Wine can otherwise
+identify a direct `Z:` reference to the game's original as the same module as
+our builtin proxy, causing delegation to loop back into the proxy.
 
-```sh
-export Enabled_Metal_FSR4=1
-export Enabled_Metal_FG=0
-```
+The originals must be under this prefix's `drive_c`, and the game must request
+the overridden DLL through its `C:` path. Isolated loader probes validated
+these conditions; full game behavior still needs qualification. If the game
+requests its DLL through `Z:`, the hook may not engage.
 
-These switches enable the corresponding features in the installed wrapper.
-They do not install or locate the required DLLs by themselves. Local test launchers
-supply the library paths and backend configuration.
+The native dylib is addressed through `METAL_FSR4_LIBRARY`, which the launcher
+sets to the full Wine `\??\Z:` path. The PE contains its own `LabFullFrame`
+entry, so `METAL_FSR4_HELPER`, `METAL_FSR4_WRAPPER`, and a D3D12 preload are no
+longer needed in this package.
 
-| Variable | Purpose |
-| --- | --- |
-| `Enabled_Metal_FSR4` | Enable the Metal FSR 4 upscaler (`1` or `0`) |
-| `Enabled_Metal_FG` | Enable AMD frame generation (`1` or `0`) |
-| `METAL_FSR4_UPGRADE31` | Allow the wrapper to replace supported FSR 3.1 calls |
-| `METAL_FSR4_ASSET_ROOT` | Absolute directory containing `shaders/` and `weights/` |
-| `METAL_FSR4_LIBRARY` | Native library path supplied by the local launcher |
-| `METAL_FSR4_HELPER` | Windows helper DLL path supplied by the local launcher |
-| `METAL_FG_DXGI_BACKEND` | Original DXGI backend path supplied by the local launcher |
-| `METAL_FG_CAPTURE_HUDLESS` | Enable the experimental double-buffered UI protection |
-| `METAL_FSR4_TRACE` | Enable provider diagnostics |
-| `METAL_FG_UI_TRACE_FRAME` | Record one selected post-upscale command sequence |
+## Settings for testers
 
-Names are case-sensitive. Previous environment names have been removed without
-aliases; rebuild the wrapper before using these settings with an older package.
+Only `WINEPREFIX` needs to be set manually. Supply the game's original DLL
+with `--original`, choose its name with `--loader`, and add `--upgrade31` only
+when testing an FSR 3.1 game with the experimental 4.0.2 upscaler. The launcher
+sets the internal Wine overrides, native library path, and provider flags in
+the game process. Exporting an enable flag alone cannot load the wrapper.
 
-## Where Metal data is stored
+Start with upscaling only. `--fg-observe` and `--fg-present` are separate
+development options; neither implements AMD FG 4.0.1. Diagnostic environment
+variables and alternate RIFE/MetalFX paths are not part of the tester setup.
 
-The release dylib contains the shader sources and model weights. When the game
-first uses the enabled Metal FSR4 path, the native library extracts them into:
+See [TESTING.md](TESTING.md) for a minimal comparison and the log lines that
+distinguish a loaded DLL from actual upscaling and generated frames.
 
-```text
-~/Library/Application Support/Metal FSR4/shared/<content-hash>/4.0.2/
-├── shaders/
-└── weights/
-```
+## Frame generation
 
-No installer or Python is needed on the player's machine. Merely starting Wine
-without loading the FSR4 wrapper does not trigger extraction. Enable the installed
-wrapper with `Enabled_Metal_FSR4=1` in the game's environment.
+This package can observe a game's original frame-generation provider while
+forwarding its calls to AMD. Its optional DXGI presentation bridge can create
+an AMD FG 3.1.6 context in KCD2 from the upscaler's motion and depth inputs.
+The source candidate now captures a pre-UI image in the cube and KCD2, and a
+KCD2 run generated frames with that capture. The player still observed image
+artifacts and lower performance, so `--fg-present` is not a qualified KCD2 FG
+mode. The local package's DXGI binary predates that source candidate.
+It neither advertises nor implements AMD FG 4.0.1. RIFE and MetalFX
+frame-generation experiments remain under
+`experimental/`; their KCD2 results still include flicker, camera alignment,
+and motion artifacts. A higher HUD FPS count alone does not qualify them as
+working frame generation.
 
-The directory name is the SHA-256 of the embedded asset payload. Matching files
-are reused; missing or changed files are restored atomically on the next library
-initialization. Different asset versions use separate directories. These are model
-inputs and shader sources, not Apple's compiled shader cache. Unused versions can
-be deleted after games using them have closed; the next use recreates them.
+## Source and license
 
-`METAL_FSR4_ASSET_ROOT` remains an explicit override for development. It must point
-to an existing absolute directory containing `shaders/` and `weights/` and bypasses
-automatic extraction. Older builds without embedded assets retain their relative
-`../4.0.2/` lookup and must be rebuilt for the standalone release layout.
+- `src/runtime/`: FidelityFX provider and Metal network entry points.
+- `src/bridge/`: D3D12 resource and command transport.
+- `src/shaders/`: Metal shaders.
+- `experimental/`: cube, FG transport prototypes and diagnostic tools. These
+  are development sources, not supported game modes.
 
-## Development cube
-
-```sh
-./build.sh dev build
-./build.sh dev run
-```
-
-The cube is a compiled Windows executable run through Wine/GPTK. Python is used
-by the local build and launch tools to prepare the test, supply paths/environment,
-collect logs and manage the run; it does not execute the neural network. The network
-runs in the native Metal library. You invoke these tools through `build.sh`; Python
-3 is still a local development dependency, not a file to copy into the game.
-
-The cube is a separate development tool, not part of the runtime distribution.
-`dev build` prints a new fixture path; `dev run` uses the selected fixture unless
-an explicit `--fixture` is supplied. Building alone does not select a new fixture.
-The currently selected cube inputs belong to an older private candidate, not the
-current release. Launcher argument handling and selected manifest hashes were
-checked after the shell-menu change; a fresh cube execution against the current
-release has not been validated. A successful `dev run` must not be treated as a
-test of a different release package.
-Game compatibility and image quality still require testing in the actual game.
-
-## Current scope
-
-FSR 4.0.2 inference and AMD frame generation have run together in KCD2. The latest
-user-tested HUD capture variant produced readable UI at approximately 45 FPS in
-that scene. This was a local observation, not a controlled performance benchmark
-or a guarantee for other games. FSR 4.1.1 remains a separate private experiment.
-
-Scaling ratios and trained model presets are different settings. Support for all
-five game-menu scaling modes is not yet a completed validation target.
-
-## Upstream resources
-
-- [AMD FidelityFX SDK 2.3.0](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/tree/v2.3.0)
-- [AMD FSR SDK documentation](https://gpuopen.com/manuals/fsr_sdk/)
-- [AMD Frame Generation API](https://gpuopen.com/manuals/fsr_sdk/techniques/frame-interpolation-api/)
-- [AMD Frame Generation swapchain and UI composition](https://gpuopen.com/manuals/fsr_sdk/techniques/frame-interpolation-swap-chain/)
-
-## License
-
-The project's original implementation is licensed under the
-**GNU General Public License, version 3** (`GPL-3.0-only`). See [LICENSE](LICENSE).
-The license text matches the file in the
-[project repository](https://github.com/Alien4042x/metal-fsr-4/blob/main/LICENSE).
-
-Third-party components retain their respective license terms and copyright
-notices. These are collected in
-[THIRD-PARTY-NOTICES.txt](licenses/THIRD-PARTY-NOTICES.txt).
-The project license does not relicense AMD binaries, model weights or game files.
-Links to upstream projects do not replace their license requirements.
+This project is GPL-3.0. AMD binaries, game files, and model assets retain
+their upstream terms; see `licenses/` for notices.

@@ -9,6 +9,12 @@ float3 dxExp(float3 v){return exp2(v*1.4426950408889634f);}
 float3 dxLog(float3 v){return log2(v)*.6931471805599453f;}
 float dxRcp(float v){return 1.f/v;}
 float3 dxRcp(float3 v){return 1.f/v;}
+// R11G11B10 has the same exponent bias as half, with shorter mantissas.
+// Shifting into half preserves normal, subnormal, infinity and NaN encodings.
+float3 unpackR11G11B10(uint v){return float3(
+ float(as_type<half>(ushort((v&0x7ffu)<<4))),
+ float(as_type<half>(ushort(((v>>11)&0x7ffu)<<4))),
+ float(as_type<half>(ushort(((v>>22)&0x3ffu)<<5))));}
 float fromHalf(uint b){return float(as_type<half>(ushort(b)));}
 float3 load3(device const float* b,uint i){return float3(b[i*3],b[i*3+1],b[i*3+2]);}
 float4 load4(device const float* b,uint i){return float4(b[i*4],b[i*4+1],b[i*4+2],b[i*4+3]);}
@@ -40,8 +46,9 @@ struct Temporal {
  device const ushort *network;
  device float *history,*recurrent;
  device uchar* output;
+ // Exposure is the first scalar at texel (0,0), including RGBA32F inputs.
  float loadExposure(){return cfg.format[3]==54?float(*(device const half*)inputExposure):*(device const float*)inputExposure;}
- float3 loadColor(int2 p){auto b=low+uint(p.y)*cfg.pitch[0];if(cfg.format[0]==10){auto v=(device const half*)(b+uint(p.x)*8);return float3(v[0],v[1],v[2]);}auto v=(device const float*)(b+uint(p.x)*16);return float3(v[0],v[1],v[2]);}
+ float3 loadColor(int2 p){auto b=low+uint(p.y)*cfg.pitch[0];if(cfg.format[0]==26)return unpackR11G11B10(*(device const uint*)(b+uint(p.x)*4));if(cfg.format[0]==10){auto v=(device const half*)(b+uint(p.x)*8);return float3(v[0],v[1],v[2]);}auto v=(device const float*)(b+uint(p.x)*16);return float3(v[0],v[1],v[2]);}
  float readDepth(int2 p){uint v=*(device const uint*)(depth+uint(p.y)*cfg.pitch[1]+uint(p.x)*4);return cfg.format[1]==44?float(v&0xffffffu)/16777215.f:as_type<float>(v);}
  float2 readMotion(int2 p){auto b=motion+uint(p.y)*cfg.pitch[2];if(cfg.format[2]==34){auto v=(device const half*)(b+uint(p.x)*4);return float2(v[0],v[1]);}auto v=(device const float*)(b+uint(p.x)*8);return float2(v[0],v[1]);}
  void writeColor(uint i,float3 v){auto b=(device ushort*)(output+(i/W)*cfg.outputPitch+(i%W)*8);for(uint c=0;c<3;c++)b[c]=ushort(halfRNE(v[c]));b[3]=0x3c00;}
@@ -156,4 +163,18 @@ kernel void native_reconstruct(constant FrameParams& cfg [[buffer(0)]],device co
 }
 kernel void native_sharpen(constant FrameParams& cfg [[buffer(0)]],device const uchar* low [[buffer(1)]],device const uchar* depth [[buffer(2)]],device const uchar* motion [[buffer(3)]],device const uchar* inputExposure [[buffer(4)]],device const float* oldHistory [[buffer(5)]],device const float* oldRecurrent [[buffer(6)]],device ushort* features [[buffer(7)]],device float* pre [[buffer(8)]],device const ushort* network [[buffer(9)]],device float* history [[buffer(10)]],device float* recurrent [[buffer(11)]],device uchar* output [[buffer(12)]],uint i [[thread_position_in_grid]]){
  Temporal t{cfg,low,depth,motion,inputExposure,oldHistory,oldRecurrent,features,pre,network,history,recurrent,output};t.sharpen(i);
+}
+
+// Optional output-space resampling around the unchanged neural graph. Temporal
+// preparation, reconstruction, history and final output remain full resolution.
+struct Resize16Params {uint srcWidth,srcHeight,srcStride,dstWidth,dstHeight,dstStride;};
+kernel void native_resize16(constant Resize16Params& p [[buffer(0)]],device const ushort* src [[buffer(1)]],device ushort* dst [[buffer(2)]],uint i [[thread_position_in_grid]]){
+    if(i>=p.dstWidth*p.dstHeight)return;
+    uint dx=i%p.dstWidth,dy=i/p.dstWidth;
+    float2 at=(float2(dx,dy)+.5f)*float2(p.srcWidth,p.srcHeight)/float2(p.dstWidth,p.dstHeight)-.5f;
+    at=clamp(at,0.f,float2(p.srcWidth-1,p.srcHeight-1));
+    int2 lo=int2(floor(at)),hi=min(lo+1,int2(int(p.srcWidth)-1,int(p.srcHeight)-1));float2 f=at-float2(lo);
+    uint pos[4]={uint(lo.y)*p.srcStride+uint(lo.x),uint(lo.y)*p.srcStride+uint(hi.x),uint(hi.y)*p.srcStride+uint(lo.x),uint(hi.y)*p.srcStride+uint(hi.x)};
+    float w[4]={(1.f-f.x)*(1.f-f.y),f.x*(1.f-f.y),(1.f-f.x)*f.y,f.x*f.y};
+    for(uint c=0;c<8;++c){float v=0;for(uint q=0;q<4;++q)v+=float(as_type<half>(src[pos[q]*8+c]))*w[q];dst[(dy*p.dstStride+dx)*8+c]=as_type<ushort>(half(v));}
 }

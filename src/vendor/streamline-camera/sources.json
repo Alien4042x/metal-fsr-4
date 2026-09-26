@@ -1,0 +1,30 @@
+{
+  "sl_consts.h": {
+    "sha256": "17de74afda2cb96204ff380464bed926f660d92015fe0304dff4e329509c88b9",
+    "source": "https://raw.githubusercontent.com/NVIDIAGameWorks/Streamline/main/include/sl_consts.h"
+  },
+  "sl_struct.h": {
+    "sha256": "28deda67ea1a74371dd4f33ff4842b7db03b2db007001da6db06f6982297928d",
+    "source": "https://raw.githubusercontent.com/NVIDIAGameWorks/Streamline/main/include/sl_struct.h"
+  },
+  "sl_result.h": {
+    "sha256": "2a0f6c12863bdc00b38910a5ec85d1f083c5671ee817a920afe626ac2a9100f7",
+    "source": "https://raw.githubusercontent.com/NVIDIAGameWorks/Streamline/main/include/sl_result.h"
+  },
+  "sl_core_types.h": {
+    "sha256": "f420cb052ce14489fc9fa0d933c3ed81a010deb01fa13b1aa8d45da1c5ba3234",
+    "source": "https://raw.githubusercontent.com/NVIDIAGameWorks/Streamline/main/include/sl_core_types.h"
+  },
+  "sl_version.h": {
+    "sha256": "48e9cb86f0ff6711304bdf3f7150f46466878bbefc21f648773267bc6a326285",
+    "source": "https://raw.githubusercontent.com/NVIDIAGameWorks/Streamline/main/include/sl_version.h"
+  },
+  "sl_appidentity.h": {
+    "sha256": "1337385ac9867d66fa6beb34c750e79aaf25a74a156a47e83f24937299dade87",
+    "source": "https://raw.githubusercontent.com/NVIDIAGameWorks/Streamline/main/include/sl_appidentity.h"
+  },
+  "sl_device_wrappers.h": {
+    "sha256": "af7741305b1a468c3a83efaa2005ecd53d2ffd7aadb8ec6868c9dcb4a8a8e3a1",
+    "source": "https://raw.githubusercontent.com/NVIDIAGameWorks/Streamline/main/include/sl_device_wrappers.h"
+  }
+}

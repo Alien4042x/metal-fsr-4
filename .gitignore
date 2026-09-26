@@ -1,4 +1,5 @@
 /.local/
+/results/
 # Generated binaries, model data and editor files
 *.dll
 *.dylib
